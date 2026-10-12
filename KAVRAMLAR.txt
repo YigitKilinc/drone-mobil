@@ -1,0 +1,1057 @@
+================================================================================
+  KAVRAMLAR — PROJEDE BİLMEN GEREKEN HER ŞEY
+  Türkçe Sesli Komutla Drone Kontrolü
+  Her konu üç başlıkla anlatılır:
+    NEDİR        : kavramın kendisi
+    GENEL KULLANIM: dünyada nerelerde kullanılır
+    BİZDE        : bu projede tam olarak nerede, nasıl kullanacağız
+================================================================================
+
+İÇİNDEKİLER
+  1.  Büyük resim: bu proje hangi alanların kesişimi?
+  2.  Drone ve uçuş kontrolü
+  3.  Simülasyon ve Gazebo
+  4.  ROS 2
+  5.  PX4 <-> ROS 2 köprüsü ve offboard kontrol
+  6.  Ses işleme: VAD, STT, TTS
+  7.  LLM (büyük dil modelleri)
+  8.  Fine-tune
+  9.  Konum, koordinat ve harita
+  10. Performans ve ölçüm
+  11. Güvenlik tasarımı
+  12. Mini sözlük
+
+
+================================================================================
+1. BÜYÜK RESİM
+================================================================================
+
+Bu proje dört ayrı alanı birbirine bağlıyor:
+
+  Konuşma işleme  ->  Doğal dil anlama  ->  Robotik ara katman  ->  Uçuş kontrolü
+  (ses -> metin)      (metin -> niyet)      (niyet -> hedef)        (hedef -> motor)
+  VAD, STT            LLM                   ROS 2                   PX4, Gazebo
+
+Her alanın kendi "dili" var. Projenin özü bu diller arasında çeviri yapmak:
+  ses dalgası -> Türkçe metin -> JSON komut -> ROS 2 mesajı -> PX4 setpoint'i
+  -> motor hızı.
+
+Akılda tutulacak temel fikir: Soldan sağa gidildikçe işler "belirsiz ve
+esnek"ten "kesin ve hızlı"ya döner. İnsan dili belirsizdir, bu yüzden orada
+yapay zekâ kullanırız. Uçuş kontrolü kesin olmalıdır, bu yüzden orada klasik
+mühendislik (kontrol teorisi, kurallar) kullanırız. İyi tasarım, yapay zekâyı
+sadece gerçekten gereken yerde kullanmaktır.
+
+
+================================================================================
+2. DRONE VE UÇUŞ KONTROLÜ
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 Quadcopter nasıl uçar?
+--------------------------------------------------------------------------------
+NEDİR: Dört pervaneli hava aracı. Sadece dört motorun hızını değiştirerek
+  hareket eder:
+    - Hepsi hızlanır            -> yükselir (thrust)
+    - Arkadakiler hızlanır      -> öne eğilir ve ileri gider (pitch)
+    - Bir yandakiler hızlanır   -> yana eğilir ve yana gider (roll)
+    - Çapraz çiftler farklılaşır-> kendi ekseninde döner (yaw)
+  Drone doğası gereği kararsızdır; saniyede yüzlerce kez düzeltme yapılmazsa
+  düşer. Bu yüzden bir insan (ya da LLM) motorları doğrudan süremez.
+BİZDE: Bu seviyeyle hiç uğraşmayacağız; PX4 halledecek. Ama "ileri git"in
+  aslında "öne eğil" demek olduğunu bilmek, drone'un hızlanma/frenleme
+  davranışını anlamanı sağlar.
+
+--------------------------------------------------------------------------------
+2.2 Autopilot (uçuş kontrolcüsü) ve PX4
+--------------------------------------------------------------------------------
+NEDİR: Drone'un beyni. Sensörleri okur, konumunu tahmin eder, motor
+  komutlarını üretir. PX4 açık kaynak bir autopilot yazılımıdır; gerçekte
+  Pixhawk gibi kartlarda çalışır.
+  İçindeki kontrol katmanları (içten dışa):
+      motor <- açısal hız kontrolü <- açı kontrolü <- hız kontrolü <- konum kontrolü
+  Sen en dıştakine "şu konuma git" dersin; her katman bir içtekine hedef
+  verir. Buna kademeli (cascade) kontrol denir. Her katman çoğunlukla PID
+  denen klasik bir denetleyicidir (hata = hedef - mevcut; hatayı küçültecek
+  komut üret).
+GENEL KULLANIM: Araştırma dronları, ticari dronlar, sabit kanatlar, VTOL.
+  Alternatifi ArduPilot.
+BİZDE: PX4'ü simülasyon içinde çalıştıracağız (SITL). Ona konum hedefi
+  (setpoint) göndereceğiz.
+
+--------------------------------------------------------------------------------
+2.3 Durum tahmini (EKF)
+--------------------------------------------------------------------------------
+NEDİR: Drone nerede olduğunu doğrudan bilemez; GPS (yavaş, gürültülü),
+  IMU (hızlı ama kayar), barometre, pusula gibi sensörleri birleştirerek
+  tahmin eder. PX4'te bunu EKF2 (Genişletilmiş Kalman Filtresi) yapar.
+BİZDE: ROS 2'den okuduğumuz "vehicle_local_position" bu tahminin
+  çıktısıdır. Simülasyonda bile sensörler gürültülüdür, bu yüzden "hedefe
+  vardı mı?" kontrolünde tam eşitlik değil eşik (0.5 m) kullanırız.
+
+--------------------------------------------------------------------------------
+2.4 Arm, uçuş modları
+--------------------------------------------------------------------------------
+NEDİR:
+  Arm/Disarm : Motorların devreye alınması/kapatılması. Güvenlik kilidi.
+  Uçuş modu  : Drone'un komutları kimden, nasıl alacağı.
+    Manual/Stabilized : kumandadan elle
+    Position          : kumanda, ama konum tutarak
+    Hold (Loiter)     : olduğu yerde asılı kal
+    Takeoff / Land    : otomatik kalkış / iniş
+    Return (RTL)      : kalkış noktasına dön
+    Mission           : önceden yüklenmiş rota
+    OFFBOARD          : hedefleri DIŞARIDAKİ bir bilgisayar verir
+BİZDE: Asıl modumuz OFFBOARD. "in" için Land, "eve dön" için Return
+  modlarına geçiş komutu göndereceğiz (bu işleri PX4 zaten iyi yapıyor,
+  yeniden yazmaya gerek yok).
+
+--------------------------------------------------------------------------------
+2.5 Setpoint
+--------------------------------------------------------------------------------
+NEDİR: "Hedef değer". Konum setpoint'i (x, y, z, yaw), hız setpoint'i
+  (vx, vy, vz) vb. Kontrolcü mevcut durumu setpoint'e yaklaştırmaya çalışır.
+BİZDE: Sesli komut eninde sonunda bir setpoint'e dönüşür. "500 metre yüksel"
+  = "z hedefini 500 m yukarı taşı". Konum setpoint'i kullanacağız çünkü
+  "şu kadar git" türü komutlara doğrudan karşılık gelir.
+
+--------------------------------------------------------------------------------
+2.6 Koordinat sistemleri: NED, gövde ekseni, yaw
+--------------------------------------------------------------------------------
+NEDİR:
+  NED (North-East-Down): PX4'ün yerel koordinat sistemi. Başlangıç noktası
+    orijin; x = kuzey, y = doğu, z = AŞAĞI. Yani 100 m yukarıda z = -100.
+  ENU (East-North-Up): ROS dünyasının alışılmış sistemi; z yukarı. PX4
+    mesajlarıyla çalışırken NED kullanılır — karıştırmak en klasik hatadır.
+  Gövde ekseni: drone'a göre ileri/sağ/aşağı. "İleri git" gövdeye göredir;
+    "kuzeye git" dünyaya göredir.
+  Yaw: burnun baktığı yön. PX4'te 0 = kuzey, saat yönünde artar, radyan.
+BİZDE: Dönüşüm formülü (gövde -> NED), yaw = ψ iken:
+      kuzey = ileri * cos(ψ) - sag * sin(ψ)
+      dogu  = ileri * sin(ψ) + sag * cos(ψ)
+  "ileri 100 m" komutu geldiğinde bu formülle NED ofseti bulunur ve mevcut
+  konuma eklenir. "kuzeye 100 m" komutunda dönüşüm gerekmez (x += 100).
+
+--------------------------------------------------------------------------------
+2.7 Failsafe ve geofence
+--------------------------------------------------------------------------------
+NEDİR:
+  Failsafe : Bir şey ters gittiğinde (bağlantı koptu, batarya bitti,
+             offboard sinyali kesildi) PX4'ün kendiliğinden yaptığı güvenli
+             davranış (asılı kal, in, eve dön).
+  Geofence : Sanal çit. Drone belirlenen yatay/dikey sınırın dışına çıkamaz.
+BİZDE: İki katman güvenlik: bizim Python güvenlik katmanımız (komutu baştan
+  reddeder) + PX4'ün kendi failsafe/geofence'i (bizim kodumuz çökse bile
+  çalışır). Offboard failsafe'i özellikle önemli: setpoint akışımız kesilirse
+  PX4 kontrolü bizden alır.
+
+--------------------------------------------------------------------------------
+2.8 MAVLink, uORB, QGroundControl
+--------------------------------------------------------------------------------
+NEDİR:
+  uORB    : PX4'ün KENDİ İÇİNDEKİ mesajlaşma sistemi (modüller arası).
+  MAVLink : Drone ile yer istasyonu arasındaki standart haberleşme protokolü.
+  QGroundControl (QGC): Yer istasyonu programı; harita, telemetri, parametre.
+BİZDE: uORB mesajları uXRCE-DDS köprüsüyle ROS 2 topic'i olur (Bölüm 5).
+  MAVLink'i doğrudan kullanmayacağız; QGC onu kullanarak simülasyona
+  bağlanır. QGC bizim için "izleme ekranı" ve parametre ayar aracı.
+
+
+================================================================================
+3. SİMÜLASYON VE GAZEBO
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 Neden simülasyon?
+--------------------------------------------------------------------------------
+NEDİR: Gerçek dünyayı bilgisayarda taklit etmek. Drone düşerse sadece
+  yeniden başlatırsın. Hızlı deneme, sıfır maliyet, sıfır risk.
+BİZDE: Tüm geliştirme ve test simülasyonda. Yanlış anlaşılan bir sesli
+  komutun bedeli burada sıfır.
+
+--------------------------------------------------------------------------------
+3.2 Gazebo'nun parçaları
+--------------------------------------------------------------------------------
+NEDİR:
+  Fizik motoru : Kuvvet, çarpışma, yerçekimi hesaplar.
+  World (dünya): Ortamın tanımı (zemin, binalar, ışık, rüzgâr). SDF
+                 formatında bir dosya.
+  Model        : Dünyadaki bir nesne (drone, ağaç). O da SDF.
+  Plugin       : Modele davranış ekleyen kod (motor itkisi, sensör üretimi).
+  Sensörler    : IMU, GPS, kamera, LiDAR — gerçeğine benzer gürültülü veri
+                 üretir.
+  Sunucu/GUI   : Hesaplama (server) ve görselleştirme (GUI) ayrıdır; GUI'siz
+                 (headless) çalıştırılabilir.
+  Jetty        : Gazebo'nun sürüm adı (ROS 2 Lyrical'ın resmi eşi).
+BİZDE: PX4'ün hazır "x500" quadcopter modelini ve varsayılan dünyayı
+  kullanacağız. Kendi modelimizi yazmayacağız. Performans için headless
+  çalıştırma ve kamerasız model tercih edilecek.
+
+--------------------------------------------------------------------------------
+3.3 SITL (Software In The Loop)
+--------------------------------------------------------------------------------
+NEDİR: Autopilot yazılımının gerçek kart yerine bilgisayarında çalışması.
+  PX4, Gazebo'dan sahte sensör verisi alır, Gazebo'ya motor komutu yollar.
+  PX4 açısından gerçek uçuştan farkı yoktur. (HITL = aynı şeyin gerçek
+  kart üzerinde yapılanı.)
+  Döngü:  Gazebo --sensör--> PX4 --motor komutu--> Gazebo --fizik--> ...
+BİZDE: `make px4_sitl gz_x500` bu döngüyü başlatır. Önemli sonuç: burada
+  yazdığımız ROS 2 kodu gerçek drone'da neredeyse aynen çalışır.
+
+--------------------------------------------------------------------------------
+3.4 Gerçek zaman faktörü (RTF)
+--------------------------------------------------------------------------------
+NEDİR: Simülasyon zamanının gerçek zamana oranı. RTF = 1.0 gerçek zamanlı;
+  0.5 ise bilgisayar yetişemiyor, simülasyon yarı hızda akıyor.
+BİZDE: RTF 1'in altına düşerse gecikme ölçümlerin yanıltıcı olur ve drone
+  "ağır" görünür. STT/LLM CPU'yu yiyorsa RTF düşer; bu yüzden kaynak
+  paylaşımına dikkat edeceğiz.
+
+
+================================================================================
+4. ROS 2
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1 ROS 2 nedir?
+--------------------------------------------------------------------------------
+NEDİR: "Robot Operating System" — adına rağmen işletim sistemi değil;
+  robot yazılımı parçalarının birbiriyle konuşmasını sağlayan bir ara
+  katman (middleware) + araç seti + hazır paket ekosistemi. "Lyrical" bir
+  dağıtım (sürüm) adıdır.
+  Temel fikir: Büyük tek bir program yerine, her biri tek iş yapan küçük
+  programlar (node) yaz; standart mesajlarla haberleşsinler.
+GENEL KULLANIM: Robot kolları, otonom araçlar, dronlar, mobil robotlar.
+BİZDE: Ses, LLM, yürütücü, harita, TTS ayrı node'lar; ROS 2 bunları ve
+  PX4'ü birbirine bağlıyor.
+
+--------------------------------------------------------------------------------
+4.2 Node
+--------------------------------------------------------------------------------
+NEDİR: Çalışan tek bir program/süreç birimi. Bir işi vardır.
+BİZDE: stt_node, parser_node, executor_node, places_node, tts_node,
+  latency_monitor. Biri çökerse diğerleri yaşar; birini değiştirmek
+  diğerlerini etkilemez.
+
+--------------------------------------------------------------------------------
+4.3 Topic, mesaj, publisher, subscriber
+--------------------------------------------------------------------------------
+NEDİR: Topic, adı olan bir veri kanalıdır. Publisher kanala mesaj yazar,
+  subscriber okur. Yayıncı kimin dinlediğini bilmez (gevşek bağlılık).
+  Tek yönlü, sürekli akan veri için kullanılır. Her topic'in bir mesaj
+  tipi vardır (alanları .msg dosyasında tanımlı).
+  Benzetme: radyo frekansı. Yayın yapan yapar, isteyen açar dinler.
+GENEL KULLANIM: Sensör verisi, durum bilgisi, hız komutları.
+BİZDE:
+    /voice/text       stt_node -> parser_node        tanınan metin
+    /drone/command    parser_node -> executor_node   komut listesi
+    /drone/feedback   executor_node -> tts/panel     durum bildirimi
+    /fmu/in/...       executor_node -> PX4           setpoint ve komutlar
+    /fmu/out/...      PX4 -> executor_node           telemetri
+
+--------------------------------------------------------------------------------
+4.4 Service
+--------------------------------------------------------------------------------
+NEDİR: İstek-cevap. Bir node sorar, diğeri cevaplar. Kısa süren, tek
+  seferlik işler için. Benzetme: telefonla soru sormak.
+BİZDE: /map/find_nearest — "şu konuma en yakın hastane nerede?" sorusu ve
+  cevabı. Sürekli akış değil, soru-cevap olduğu için service doğru araç.
+
+--------------------------------------------------------------------------------
+4.5 Action
+--------------------------------------------------------------------------------
+NEDİR: Uzun süren görevler için: hedef gönderilir, ilerleme bildirimi
+  (feedback) gelir, sonunda sonuç döner, istenirse iptal edilir.
+  Benzetme: kargo siparişi — verirsin, takip edersin, teslim edilir ya da
+  iptal edersin.
+GENEL KULLANIM: "Şu noktaya git", "kolu şu pozisyona getir".
+BİZDE: Başlangıçta sadelik için topic kullanıyoruz (komut + feedback).
+  İleride "500 metre yüksel" gibi uzun komutları action'a çevirmek
+  (ilerleme: %40, iptal edilebilir) doğal bir geliştirme.
+
+--------------------------------------------------------------------------------
+4.6 QoS (Quality of Service)                         *** çok takılınan yer ***
+--------------------------------------------------------------------------------
+NEDİR: Bir topic'in teslimat kuralları:
+  Reliability : RELIABLE (her mesaj ulaşsın, gerekirse tekrar gönder) ya da
+                BEST_EFFORT (ulaşırsa ulaşır; hızlı, kayıp olabilir).
+  Durability  : VOLATILE (sonradan gelen eski mesajı alamaz) ya da
+                TRANSIENT_LOCAL (son mesaj saklanır, sonradan gelen alır).
+  History/Depth: Kaç mesaj kuyrukta tutulsun.
+  Kural: Yayıncı ile abonenin QoS'u UYUMLU olmalı. Yayıncı BEST_EFFORT,
+  abone RELIABLE isterse bağlantı kurulmaz ve HİÇBİR HATA MESAJI ÇIKMAZ —
+  sadece veri gelmez.
+BİZDE: PX4 topic'leri BEST_EFFORT yayınlanır. Bu yüzden PX4 abonelerimizi
+  BEST_EFFORT + TRANSIENT_LOCAL + depth=1 ile açacağız. Kendi topic'lerimizde
+  (/drone/command) ise RELIABLE kullanırız; komut kaybolmamalı.
+
+--------------------------------------------------------------------------------
+4.7 Callback, timer, executor
+--------------------------------------------------------------------------------
+NEDİR:
+  Callback : Bir olay olunca çağrılan fonksiyon (mesaj geldi, zaman doldu).
+  Timer    : Belirli aralıkla callback çağırır.
+  Executor : Callback'leri sırayla çalıştıran döngü (rclpy.spin).
+  Önemli: Varsayılan executor tek iş parçacıklıdır. Bir callback uzun
+  sürerse (ör. LLM cevabını bekliyorsa) diğer callback'ler BEKLER.
+BİZDE:
+  - executor_node'da 20-50 Hz timer setpoint yayınlar. Bu callback asla
+    bloklanmamalı; içinde ağ isteği, uzun hesap olmaz.
+  - LLM ve harita çağrıları ayrı node'da (ya da ayrı iş parçacığında/async)
+    yapılır ki setpoint akışı kesilmesin. Node'ları ayırmamızın bir nedeni
+    de bu.
+
+--------------------------------------------------------------------------------
+4.8 Paket, workspace, colcon, launch, parametre
+--------------------------------------------------------------------------------
+NEDİR:
+  Paket     : Kodun dağıtım birimi (package.xml + kaynaklar).
+  Workspace : Paketlerin durduğu klasör (ros2_ws/src).
+  colcon    : Derleme aracı (`colcon build`). Sonra `source
+              install/setup.bash` ile ortam tanıtılır — unutulursa
+              paketlerin "bulunamaz".
+  Launch    : Birçok node'u tek komutla, parametreleriyle başlatan dosya.
+  Parametre : Node'un çalışma anı ayarları (YAML dosyasından).
+BİZDE: Her bileşen bir paket; drone_bringup launch dosyalarını ve limitler,
+  model yolu, VAD süresi gibi parametreleri tutar. Limitleri koda değil
+  parametre dosyasına yazmak, yeniden derlemeden ayar yapmayı sağlar.
+
+--------------------------------------------------------------------------------
+4.9 Özel mesaj tanımları (interfaces)
+--------------------------------------------------------------------------------
+NEDİR: Kendi .msg/.srv/.action dosyalarını tanımlayabilirsin; ROS 2 bunlardan
+  Python/C++ sınıfları üretir.
+BİZDE: drone_interfaces paketi. LLM'in ürettiği JSON, DroneCommand mesajına
+  çevrilir. Böylece yürütücü "string içinde JSON" ayrıştırmak zorunda
+  kalmaz; tipli, doğrulanmış alanlarla çalışır.
+
+--------------------------------------------------------------------------------
+4.10 DDS
+--------------------------------------------------------------------------------
+NEDİR: ROS 2'nin altındaki ağ haberleşme standardı. Node'lar birbirini
+  merkezi bir sunucu olmadan otomatik bulur (discovery).
+BİZDE: Doğrudan uğraşmayacağız. Bilmen gereken: aynı ağdaki aynı
+  ROS_DOMAIN_ID'li node'lar birbirini görür. Uzak makine + kendi
+  bilgisayarın arasında ROS 2 konuşturacaksan bu ayar önem kazanır.
+
+--------------------------------------------------------------------------------
+4.11 Araçlar
+--------------------------------------------------------------------------------
+  ros2 topic list / echo / hz / pub   topic'leri gör, dinle, hızını ölç, yayınla
+  ros2 node list / info               çalışan node'lar
+  ros2 interface show <tip>           mesaj alanları
+  ros2 service call                   servis çağır
+  ros2 bag record / play              tüm trafiği kaydet / tekrar oynat
+  rqt_graph                           node-topic bağlantı şeması
+BİZDE: `ros2 topic pub` ile Faz 1'de LLM olmadan komut göndereceğiz;
+  `ros2 topic hz` ile setpoint hızını doğrulayacağız; rosbag ile demo
+  uçuşlarını kaydedip hata ayıklayacağız.
+
+
+================================================================================
+5. PX4 <-> ROS 2 KÖPRÜSÜ VE OFFBOARD KONTROL
+================================================================================
+
+--------------------------------------------------------------------------------
+5.1 uXRCE-DDS
+--------------------------------------------------------------------------------
+NEDİR: PX4'ün iç mesajlarını (uORB) ROS 2 dünyasına taşıyan köprü.
+  İki parça:
+    Client : PX4'ün içinde çalışır.
+    Agent  : Bilgisayarda çalışır (MicroXRCEAgent); client'tan gelenleri
+             ROS 2 topic'i olarak yayınlar ve tersini yapar.
+  px4_msgs : uORB mesajlarının ROS 2 tanımları. PX4 sürümüyle birebir
+             uyumlu olmalı; alanlar kayarsa veri bozuk gelir ya da gelmez.
+GENEL KULLANIM: PX4 + ROS 2'nin resmi, düşük gecikmeli bağlantı yolu.
+  (Eski/alternatif yol MAVROS: MAVLink üzerinden; daha fazla çeviri katmanı.)
+BİZDE: Agent ayrı bir terminalde hep açık. Biz sadece /fmu/in ve /fmu/out
+  topic'lerini kullanırız.
+
+--------------------------------------------------------------------------------
+5.2 Offboard kontrolün mantığı
+--------------------------------------------------------------------------------
+NEDİR: PX4'e "kontrolü dışarıdaki bilgisayara veriyorum" denen mod. PX4
+  bu konuda temkinlidir:
+    - Offboard'a geçmeden önce setpoint akışının başlamış olmasını ister.
+    - Akış ~yarım saniyeden fazla kesilirse offboard'dan çıkar (failsafe).
+  Sebep: Dışarıdaki bilgisayar çökerse drone başıboş kalmasın.
+  Üç mesaj:
+    OffboardControlMode : "Konum mu, hız mı, ivme mi göndereceğim?" beyanı.
+                          Sürekli yayınlanır; "ben hayattayım" sinyalidir.
+    TrajectorySetpoint  : Asıl hedef (position[3], velocity[3], yaw).
+                          Kullanılmayan alanlar NaN bırakılır.
+    VehicleCommand      : Tek seferlik komutlar: arm/disarm, mod değiştir,
+                          in, eve dön.
+BİZDE: executor_node'daki timer her tikte ilk iki mesajı yayınlar. Sesli
+  komut geldiğinde yapılan tek şey "hedef" değişkenini güncellemektir; akış
+  zaten devam ediyordur. Bu tasarım hem güvenli (akış kesilmez) hem hızlıdır
+  (komut anında etkili olur, mod geçişi beklenmez).
+
+  Kalkış sırası:
+    1) ~1 sn boyunca setpoint yayınla (hedef = istenen irtifa)
+    2) VehicleCommand: offboard moduna geç
+    3) VehicleCommand: arm
+    4) Drone hedefe yükselir
+
+--------------------------------------------------------------------------------
+5.3 Konum mu hız mı?
+--------------------------------------------------------------------------------
+NEDİR: Konum setpoint'i "şuraya git ve dur"; hız setpoint'i "şu hızla git
+  (ben dur diyene kadar)".
+BİZDE: Mesafeli komutlar (yüksel 500, ileri 100) -> konum setpoint'i.
+  İleride "ben dur diyene kadar ileri git" gibi süreğen komutlar eklersen
+  hız setpoint'i kullanırsın. "dur" = hedefi mevcut konuma eşitle.
+
+
+================================================================================
+6. SES İŞLEME: VAD, STT, TTS
+================================================================================
+
+--------------------------------------------------------------------------------
+6.1 Dijital ses
+--------------------------------------------------------------------------------
+NEDİR: Mikrofon hava basıncını saniyede binlerce kez ölçer.
+  Örnekleme hızı: saniyedeki ölçüm sayısı. Konuşma tanıma için standart
+  16.000 Hz (16 kHz), tek kanal (mono).
+BİZDE: Mikrofonu 16 kHz mono açacağız; modellerin beklediği biçim bu.
+  Yanlış örnekleme hızı = anlamsız STT çıktısı.
+
+--------------------------------------------------------------------------------
+6.2 VAD (Voice Activity Detection)
+--------------------------------------------------------------------------------
+NEDİR: Ses parçasında "konuşma var mı?" sorusuna cevap veren küçük model.
+  20-30 ms'lik parçalara bakar, olasılık üretir.
+  Bitiş tespiti (endpointing): "Konuşma bitti" demek için belli süre
+  sessizlik beklenir. Kısa tutarsan cümle ortasındaki duraksamada keser;
+  uzun tutarsan her komuta o kadar gecikme eklersin.
+GENEL KULLANIM: Sesli asistanlar, toplantı yazılımları, telefon sistemleri.
+BİZDE: Silero VAD. Bitiş sessizliği doğrudan gecikme bütçemizin en büyük
+  kalemlerinden; 250-350 ms'ye indirmeyi deneyeceğiz. Komutlarımız kısa
+  olduğu için bu mümkün.
+
+--------------------------------------------------------------------------------
+6.3 STT / ASR (konuşmadan metne)
+--------------------------------------------------------------------------------
+NEDİR: Sesi yazıya çeviren model.
+  Whisper nasıl çalışır (kabaca):
+    1) Ses, mel-spektrograma çevrilir (zaman-frekans "resmi").
+    2) Encoder bu resmi anlam vektörlerine dönüştürür.
+    3) Decoder, bir dil modeli gibi, metni token token üretir.
+  Yani Whisper'ın yarısı zaten bir dil modelidir; bu yüzden bağlama göre
+  kelime tahmin eder ve initial_prompt ile yönlendirilebilir.
+  Boyutlar: tiny, base, small, medium, large; "turbo" = large'ın decoder'ı
+  küçültülmüş hızlı sürümü.
+  faster-whisper: Whisper'ın CTranslate2 ile hızlandırılmış uygulaması.
+  Toplu (batch) ve akışlı (streaming) STT:
+    Toplu  : Cümle biter, tamamı işlenir. Whisper böyledir.
+    Akışlı : Konuşma sürerken kelime kelime çıktı verir. Daha düşük
+             gecikme; genelde biraz daha düşük doğruluk.
+  Ölçütler:
+    WER (kelime hata oranı), CER (karakter hata oranı): düşük = iyi.
+    Türkçe sondan eklemeli olduğu için tek ek hatası bütün kelimeyi yanlış
+    saydırır; Türkçede CER de anlamlıdır.
+    RTF: işlem süresi / ses süresi. 0.1 = 3 sn'lik ses 0.3 sn'de işlenir.
+GENEL KULLANIM: Altyazı, sesli asistan, çağrı merkezi, dikte.
+BİZDE: GPU varsa faster-whisper large-v3-turbo, yoksa küçük/akışlı bir
+  model. language="tr" sabit, beam_size=1, initial_prompt'ta drone
+  kelimeleri. Bizim için asıl ölçüt WER değil "komut doğru anlaşıldı mı";
+  "yükselir misin" yerine "yüksel misin" yazması sorun değildir, "500"
+  yerine "5" yazması felakettir. Bu yüzden kendi test kayıtlarımızla
+  ölçeceğiz.
+
+--------------------------------------------------------------------------------
+6.4 Metin normalizasyonu
+--------------------------------------------------------------------------------
+NEDİR: STT çıktısını tek biçime sokmak: sayıları rakama çevirmek,
+  birimleri standartlaştırmak, noktalama/büyük harf temizliği.
+BİZDE: "Beş yüz metre yüksel." -> "500 m yüksel". Sayı çevirisini LLM'e
+  bırakmıyoruz çünkü küçük modellerin en zayıf yanı sayılardır; kural
+  tabanlı çeviri hem kesin hem anlık.
+
+--------------------------------------------------------------------------------
+6.5 Anahtar kelime tanıma (KWS) ve uyandırma kelimesi
+--------------------------------------------------------------------------------
+NEDİR: Sadece birkaç belirli kelimeyi tanıyan minik, sürekli çalışan model
+  ("Hey Siri" mantığı). Tam STT'den çok daha hızlı ve hafiftir.
+BİZDE: (1) "dur" gibi acil kelimeleri cümle bitmesini beklemeden yakalamak,
+  (2) ileride "hey drone" uyandırma kelimesi.
+
+--------------------------------------------------------------------------------
+6.6 TTS (metinden konuşmaya)
+--------------------------------------------------------------------------------
+NEDİR: Yazıyı sese çeviren model.
+BİZDE: Piper ile "500 metreye yükseliyorum" gibi geri bildirimler. Dikkat:
+  hoparlörden çıkan ses mikrofona girer (yankı); TTS çalarken dinlemeyi
+  durduracağız.
+
+
+================================================================================
+7. LLM (BÜYÜK DİL MODELLERİ)
+================================================================================
+
+--------------------------------------------------------------------------------
+7.1 LLM nedir?
+--------------------------------------------------------------------------------
+NEDİR: Çok büyük metin yığınları üzerinde tek bir işi öğrenmiş sinir ağı:
+  "Şu ana kadarki metne bakarak SIRADAKİ PARÇAYI tahmin et."
+  Bu basit görevi çok iyi yapabilmek için dili, bilgiyi ve akıl yürütme
+  kalıplarını içselleştirmek zorunda kalır. Sohbet, çeviri, kod yazma,
+  JSON üretme — hepsi "sıradakini tahmin et"in tekrar tekrar uygulanmasıdır.
+GENEL KULLANIM: Sohbet asistanları, kod yardımcıları, özetleme, çeviri,
+  sınıflandırma, bilgi çıkarma, araç kullanan ajanlar.
+BİZDE: "Bilgi çıkarma / yapılandırma" işi: serbest Türkçe cümleden komut
+  adı ve parametreleri çıkarıp JSON'a dökmek. Sohbet etmeyecek, açıklama
+  yazmayacak.
+
+--------------------------------------------------------------------------------
+7.2 Token ve tokenizer
+--------------------------------------------------------------------------------
+NEDİR: Model harf ya da kelime değil "token" görür: sık geçen karakter
+  dizileri. Tokenizer metni token'lara böler ve her birine numara verir.
+  "yüksel" tek token olabilir, "yükselebilir misin" 4-5 token.
+  Türkçe sondan eklemeli olduğu için İngilizceye göre kelime başına daha
+  çok token harcar.
+  Neden önemli: Modelin hızı ve maliyeti token sayısıyla ölçülür. Girdi
+  token'ları okunur (hızlı), çıktı token'ları tek tek üretilir (yavaş).
+BİZDE: Hız = az token. Kısa sistem prompt'u (az girdi), kısa JSON
+  anahtarları (az çıktı). Çıktımız ~15-25 token olacak; gecikmenin düşük
+  olmasının asıl nedeni bu.
+
+--------------------------------------------------------------------------------
+7.3 Transformer ve dikkat (attention)
+--------------------------------------------------------------------------------
+NEDİR: LLM'lerin mimarisi. Ana fikir "dikkat": model her token'ı işlerken
+  metindeki diğer TÜM token'lara bakar ve hangilerinin ilgili olduğuna
+  kendisi karar verir. "önce 50 metre yüksel sonra 200 metre kuzeye git"
+  cümlesinde "200"ün "kuzeye git"e, "50"nin "yüksel"e ait olduğunu bu
+  mekanizma çözer.
+  Yapı: token -> vektör (embedding) -> üst üste N katman (her biri dikkat +
+  küçük bir sinir ağı) -> sıradaki token için olasılıklar.
+  Parametre: ağdaki ayarlanabilir sayılar. "0.6B" = 600 milyon parametre.
+  Daha çok parametre = daha yetenekli ama daha yavaş ve daha çok bellek.
+BİZDE: Matematiğini bilmen gerekmiyor; bilmen gereken: model boyutu hız ile
+  yetenek arasında bir takastır ve dar görevlerde küçük model yeter.
+
+--------------------------------------------------------------------------------
+7.4 Üretim (inference): otoregresif döngü
+--------------------------------------------------------------------------------
+NEDİR: Model metni tek seferde yazmaz:
+    1) Tüm girdiyi oku -> sıradaki token için olasılık dağılımı üret
+    2) Bir token seç
+    3) Onu girdinin sonuna ekle, 1'e dön
+    4) "Bitti" token'ı gelene ya da sınıra ulaşana kadar devam et
+  İki aşamanın hızı farklıdır:
+    Prompt işleme (prefill): girdi token'ları paralel işlenir — hızlı.
+    Üretim (decode)        : her çıktı token'ı ayrı bir tur — yavaş.
+  Ölçütler: TTFT (ilk token'a kadar süre), token/saniye, toplam süre.
+  Seçim ayarları:
+    temperature : 0 = hep en olası token (deterministik); yüksek = çeşitli,
+                  yaratıcı, öngörülemez.
+    max_tokens  : üretilecek en fazla token.
+BİZDE: temperature=0 (aynı cümle hep aynı komutu vermeli), max_tokens≈64
+  (model sapıtırsa bile gecikme sınırlı kalır).
+
+--------------------------------------------------------------------------------
+7.5 Bağlam penceresi, sistem prompt'u, sohbet şablonu
+--------------------------------------------------------------------------------
+NEDİR:
+  Bağlam penceresi: Modelin bir seferde görebildiği en fazla token sayısı.
+  Model durumsuzdur: önceki isteği hatırlamaz; "hafıza" dediğimiz şey
+  önceki mesajların tekrar girdiye konmasıdır.
+  Roller: system (kalıcı talimat), user (kullanıcı), assistant (model).
+  Sohbet şablonu (chat template): Bu rollerin modele hangi özel işaretlerle
+  verileceği. HER MODELİN ŞABLONU FARKLIDIR. Yanlış şablon = belirgin
+  kalite düşüşü.
+BİZDE: Her komut bağımsız, kısa bir istek: [kısa system] + [cümle]. Bağlam
+  ~100 token; -c 1024 fazlasıyla yeter (küçük bağlam = az bellek, hızlı).
+  Fine-tune'da kullandığımız şablon ve sistem prompt'u ile çalışırken
+  kullandığımız BİREBİR aynı olmalı. İleride "biraz daha" gibi bağlamlı
+  komutlar için son komutu girdiye ekleyeceğiz.
+
+--------------------------------------------------------------------------------
+7.6 Prompt mühendisliği ve few-shot
+--------------------------------------------------------------------------------
+NEDİR: Modeli eğitmeden, sadece girdiyi iyi yazarak yönlendirmek.
+  Zero-shot: sadece talimat. Few-shot: talimat + birkaç örnek (girdi ->
+  çıktı). Küçük modeller örneklerden çok fayda görür ama her örnek prompt'u
+  uzatır.
+BİZDE: Faz 2'de (fine-tune'dan önce) few-shot prompt kullanacağız — bu
+  hem sistemi erken ayağa kaldırır hem de fine-tune'un kazancını ölçmek
+  için kıyas noktası olur. Fine-tune'dan sonra örneklere gerek kalmaz.
+
+--------------------------------------------------------------------------------
+7.7 Function calling ve yapılandırılmış çıktı
+--------------------------------------------------------------------------------
+NEDİR:
+  Function/tool calling: Modele "elinde şu fonksiyonlar var" denir; model
+  serbest metin yerine "şu fonksiyonu şu argümanlarla çağır" çıktısı verir.
+  Model fonksiyonu KENDİSİ çalıştırmaz; sadece çağrıyı tarif eder, gerçek
+  işi senin kodun yapar. LLM'leri dış dünyaya bağlamanın standart yolu.
+  Yapılandırılmış çıktı / kısıtlı üretim (constrained decoding): Üretim
+  sırasında, verilen şemaya (JSON Schema ya da GBNF dilbilgisi) uymayan
+  token'ların olasılığı sıfırlanır. Model istese de bozuk JSON üretemez.
+GENEL KULLANIM: Ajanlar, API entegrasyonları, form doldurma, veri çıkarma.
+BİZDE: Projenin kalbi. Drone komutları = fonksiyonlar. LLM
+  {"komut":"yuksel","metre":500} üretir; yürütücü gerçek işi yapar. Şema
+  kısıtı sayesinde çıktı her zaman ayrıştırılabilir, bilinen komutlardan
+  biri ve doğru tipte parametreli olur. (Dikkat: kısıt BİÇİMİ garanti eder,
+  ANLAMI değil — "alçal" denince "yuksel" yazabilir. Anlam doğruluğunu
+  fine-tune ve test sağlar.)
+
+--------------------------------------------------------------------------------
+7.8 Halüsinasyon
+--------------------------------------------------------------------------------
+NEDİR: Modelin kendinden emin biçimde yanlış/uydurma içerik üretmesi.
+  Model "bilmiyorum" demeye değil, olası devamı üretmeye eğilimlidir.
+BİZDE: Riskli hâli: alakasız cümleye komut uydurmak ya da söylenmemiş bir
+  sayı yazmak. Önlemler: "bilinmiyor" komutu + negatif örneklerle eğitim,
+  şema kısıtı, güvenlik katmanı, riskli komutta onay.
+
+--------------------------------------------------------------------------------
+7.9 Yerel çalıştırma: quantization, GGUF, llama.cpp, Ollama
+--------------------------------------------------------------------------------
+NEDİR:
+  Quantization: Parametreleri 16/32-bit yerine 8 ya da 4-bit sayılarla
+    saklamak. Model 3-4 kat küçülür ve hızlanır; doğruluk az düşer.
+    Q4_K_M: yaygın, dengeli 4-bit ayar. Q8: daha doğru, daha büyük.
+  GGUF: llama.cpp'nin tek dosyalık model formatı.
+  llama.cpp: LLM'leri CPU/GPU'da verimli çalıştıran C++ motoru.
+    llama-server: OpenAI uyumlu HTTP API sunan sunucusu.
+    -ngl: GPU'ya yüklenecek katman sayısı (99 = hepsi, 0 = sadece CPU).
+  Ollama: llama.cpp üstüne kurulu, kullanımı kolay paketleyici.
+  KV-cache / prompt cache: Model, daha önce işlediği girdi başlangıcının
+    ara sonuçlarını saklar; aynı sistem prompt'uyla gelen sonraki istekte
+    o kısmı yeniden hesaplamaz.
+GENEL KULLANIM: Gizlilik, çevrimdışı çalışma, düşük gecikme, sıfır API
+  maliyeti gereken yerler; gömülü cihazlar.
+BİZDE: Fine-tune'lu modeli GGUF Q4_K_M yapıp llama-server'da sürekli açık
+  tutacağız. parser_node localhost'a HTTP isteği atar. Yerel olması ağ
+  gecikmesini sıfırlar ve gerçek drone'da (internet yokken) çalışmayı
+  mümkün kılar.
+
+--------------------------------------------------------------------------------
+7.10 Küçük model mi büyük model mi?
+--------------------------------------------------------------------------------
+NEDİR: Büyük modeller (onlarca-yüzlerce milyar parametre) genel zekâda
+  üstündür; küçükler (1 milyarın altı - birkaç milyar) hızlı ve ucuzdur
+  ama geniş görevlerde zorlanır.
+  Kural: Görev ne kadar DAR ve İYİ TANIMLI ise o kadar küçük model yeter —
+  özellikle fine-tune ile.
+BİZDE: ~12 komut, kısa cümleler: tam küçük model işi. Büyük modeli ise
+  "öğretmen" olarak kullanacağız: eğitim verisi üretmek için (8.9).
+
+--------------------------------------------------------------------------------
+7.11 Düşünen (reasoning) modeller
+--------------------------------------------------------------------------------
+NEDİR: Bazı modeller cevaptan önce görünmez "düşünme" metni üretir. Zor
+  problemlerde doğruluğu artırır, ama onlarca-yüzlerce ek token demektir.
+BİZDE: Kapalı. Görevimiz anlık eşleme; düşünme sadece gecikme ekler.
+
+
+================================================================================
+8. FINE-TUNE
+================================================================================
+
+--------------------------------------------------------------------------------
+8.1 Eğitim nedir? (en temelden)
+--------------------------------------------------------------------------------
+NEDİR: Bir sinir ağı, milyonlarca ayarlanabilir sayıdan (parametre/ağırlık)
+  oluşan bir fonksiyondur. Eğitim şu döngüdür:
+    1) Modele bir örnek ver, çıktısını al.
+    2) Çıktı ile doğru cevap arasındaki farkı tek sayıyla ölç: KAYIP (loss).
+    3) Her parametrenin kayba katkısını hesapla (gradyan, geri yayılım).
+    4) Parametreleri kaybı azaltacak yönde azıcık değiştir.
+    5) Binlerce kez tekrarla.
+  Terimler:
+    Öğrenme oranı (learning rate): 4. adımdaki "azıcık"ın büyüklüğü. Çok
+      büyükse model savrulur, öğrenemez; çok küçükse çok yavaş öğrenir.
+    Batch     : Tek güncellemede kullanılan örnek sayısı.
+    Step      : Bir güncelleme.
+    Epoch     : Tüm veri setinin bir kez baştan sona görülmesi.
+    Optimizer : Güncelleme kuralı (AdamW yaygın olan).
+
+--------------------------------------------------------------------------------
+8.2 Ön eğitim ve fine-tune
+--------------------------------------------------------------------------------
+NEDİR:
+  Ön eğitim (pretraining): Modelin devasa veriyle sıfırdan eğitilmesi.
+    Aylar, büyük bütçeler. Bunu model üreticileri yapar.
+  Fine-tune: Ön eğitimli modeli alıp KÜÇÜK, GÖREVE ÖZEL veriyle kısa süre
+    daha eğitmek. Model dil bilgisini korur; davranışı senin görevine
+    uyarlanır. Dakikalar-saatler, tek GPU.
+  Benzetme: Üniversite mezunu birini (ön eğitim) işe alıp iki günlük iş
+    başı eğitimi vermek (fine-tune).
+GENEL KULLANIM: Belirli bir üslup/format öğretmek, dar bir görevde küçük
+  modeli güçlendirmek, alan terimlerini öğretmek, prompt'u kısaltmak.
+  Fine-tune'un İYİ OLMADIĞI yer: güncel/değişen bilgi eklemek (onun için
+  RAG ya da araç kullanımı daha uygundur).
+BİZDE: Küçük bir modele "Türkçe drone cümlesi -> bizim JSON şemamız"
+  davranışını öğretmek. Kazanç: daha yüksek doğruluk + çok kısa prompt +
+  STT hatalarına dayanıklılık.
+
+--------------------------------------------------------------------------------
+8.3 Ne zaman prompt, ne zaman RAG, ne zaman fine-tune?
+--------------------------------------------------------------------------------
+  Prompt    : İlk denenecek şey. Eğitim yok. Yeterliyse orada kal.
+  RAG       : Modelin bilmediği/değişen BİLGİ gerekiyorsa (belgeler).
+  Fine-tune : Modelin DAVRANIŞI/biçimi tutarlı değilse ya da küçük-hızlı
+              modelle büyük model kalitesi istiyorsan.
+BİZDE: Sırayla: önce prompt (Faz 2) -> ölç -> fine-tune (Faz 4) -> ölç.
+  RAG yok. Harita bilgisi ise "araç çağırma" ile çözülüyor (model bilmez,
+  API bilir).
+
+--------------------------------------------------------------------------------
+8.4 Eğitim verisinin biçimi
+--------------------------------------------------------------------------------
+NEDİR: Denetimli (supervised) fine-tune'da her örnek bir girdi ve beklenen
+  çıktıdır. Sohbet modellerinde bu bir mini konuşmadır:
+      system    : "Drone komutunu JSON'a çevir."
+      user      : "500 metre yüksel"
+      assistant : {"adimlar":[{"komut":"yuksel","metre":500}]}
+  Eğitim sırasında bu, modelin sohbet şablonuyla tek metne çevrilir ve
+  model "assistant" kısmını token token tahmin etmeyi öğrenir. Kayıp
+  yalnızca assistant kısmı üzerinden hesaplanır (girdiyi ezberletmenin
+  anlamı yok).
+BİZDE: JSONL dosyaları (her satır bir örnek). Çıktılar her zaman aynı
+  anahtar sırası ve aynı biçimde olmalı; tutarsız etiket modeli de
+  tutarsız yapar.
+
+--------------------------------------------------------------------------------
+8.5 Train / validation / test ayrımı ve ezberleme (overfitting)
+--------------------------------------------------------------------------------
+NEDİR:
+  Train : Modelin öğrendiği veri.
+  Val   : Eğitim sırasında "gerçekten öğreniyor mu, ezberliyor mu?" diye
+          bakılan veri. Modelin parametrelerini etkilemez.
+  Test  : En sonda, bir kez, nihai karne için. Asla eğitime sızmamalı.
+  Overfitting: Model eğitim örneklerini ezberler, yeni cümlelerde başarısız
+    olur. Belirti: train kaybı düşmeye devam ederken val kaybı yükselir.
+    Çözüm: daha çok ve daha çeşitli veri, daha az epoch, daha küçük r.
+  Underfitting: Model yeterince öğrenememiş; iki kayıp da yüksek.
+    Çözüm: daha çok epoch, daha yüksek öğrenme oranı/r.
+  Veri sızıntısı: Test örneklerinin (ya da çok benzerlerinin) eğitimde
+    bulunması; sonuçları sahte biçimde iyi gösterir.
+BİZDE: Şablondan üretilen verilerde sızıntı kolay olur ("500 metre yüksel"
+  train'de, "600 metre yüksel" test'te — bu gerçek bir sınav değil). Bu
+  yüzden şablon bazında böleceğiz ve asıl sınav olarak KENDİ SES
+  KAYITLARIMIZDAN oluşan seti kullanacağız.
+
+--------------------------------------------------------------------------------
+8.6 LoRA
+--------------------------------------------------------------------------------
+NEDİR: Tüm parametreleri güncellemek (full fine-tune) çok bellek ister.
+  LoRA (Low-Rank Adaptation) şunu yapar:
+    - Asıl ağırlık matrisi W dondurulur (değişmez).
+    - Yanına iki küçük matris eklenir: A ve B. Etkin ağırlık:
+          W' = W + (alpha / r) * B * A
+    - Sadece A ve B eğitilir.
+  W örneğin 1000x1000 (1 milyon sayı) ise, r=16 için A ve B toplam
+  2 * 16 * 1000 = 32.000 sayıdır. Yani %3'ü.
+  Neden işe yarar: Bir modeli yeni göreve uyarlamak için gereken değişiklik
+  genelde "düşük ranklı"dır — az sayıda yönde ayar yeter.
+  Ayarlar:
+    r (rank)      : Adaptörün kapasitesi. 8-32 tipik. Büyük r = daha çok
+                    öğrenme kapasitesi, daha çok ezber riski.
+    alpha         : Adaptörün etkisinin ölçeği. Genelde r ya da 2r.
+    target modules: Adaptörün takılacağı katmanlar (dikkat ve ara
+                    katmanların projeksiyonları). Araçlar varsayılanı seçer.
+    dropout       : Ezberi azaltan rastgele kapatma; küçük veri setinde
+                    0.05 gibi.
+  Çıktı: Birkaç MB'lık adaptör. Kullanımdan önce asıl modelle BİRLEŞTİRİLİR
+  (merge); birleşmiş model normal bir model gibi çalışır, ek gecikme olmaz.
+  QLoRA: Asıl modeli 4-bit yükleyip LoRA eğitmek; bellek daha da azalır.
+BİZDE: r=16, alpha=16 ile başlayacağız. 0.6B'lik model + birkaç bin kısa
+  örnek, ücretsiz T4 GPU'da dakikalar sürer. Küçük modelde QLoRA şart
+  değil ama zararı da yok.
+
+--------------------------------------------------------------------------------
+8.7 Araçlar
+--------------------------------------------------------------------------------
+  Hugging Face Hub : Modellerin ve veri setlerinin deposu.
+  transformers     : Modelleri yükleme/çalıştırma kütüphanesi.
+  PEFT             : LoRA gibi yöntemlerin kütüphanesi.
+  TRL (SFTTrainer) : Denetimli fine-tune eğitim döngüsü.
+  Unsloth          : Bunları saran, hızlandıran, hazır not defterleri sunan
+                     kütüphane; GGUF dışa aktarımı tek satır.
+  Colab / Kaggle   : Ücretsiz GPU'lu not defteri ortamları.
+BİZDE: Unsloth not defteri + Colab/Kaggle. GPU'n olmasa da fine-tune
+  yapabilirsin; eğitim bulutta, çalıştırma kendi makinende.
+
+--------------------------------------------------------------------------------
+8.8 Değerlendirme
+--------------------------------------------------------------------------------
+NEDİR: Kayıp değeri modelin "iyi" olduğunu söylemez; görevine özgü
+  ölçütlere bakılır.
+BİZDE:
+  Tam eşleşme   : Üretilen JSON beklenenle birebir aynı mı.
+  Komut doğruluğu / parametre doğruluğu: hatanın nerede olduğunu ayırır.
+  Yanlış kabul  : "bilinmiyor" olması gerekene komut üretme oranı — en
+                  tehlikeli hata; ayrı izlenir.
+  Yanlış ret    : Geçerli komuta "bilinmiyor" deme oranı — can sıkıcı ama
+                  güvenli.
+  Gecikme       : Ortalama ve p95.
+  Hata analizi  : Yanlışları tek tek okuyup türlere ayırmak. Fine-tune'da
+                  ilerleme, hiperparametre kurcalamaktan çok buradan çıkan
+                  "şu türden veri eksik" bulgusuyla gelir.
+  Karışıklık örneği: göreli/mutlak ("500 metre yüksel" / "500 metreye çık").
+
+--------------------------------------------------------------------------------
+8.9 Sentetik veri ve bilgi damıtma (distillation)
+--------------------------------------------------------------------------------
+NEDİR:
+  Sentetik veri: İnsanların toplamadığı, programla ya da modelle üretilmiş
+    eğitim verisi.
+  Damıtma: Büyük, yetenekli bir modelin ("öğretmen") bilgisini küçük bir
+    modele ("öğrenci") aktarmak. Pratik hâli: öğretmene veri ürettirirsin,
+    öğrenciyi o veriyle eğitirsin.
+  Veri artırma (augmentation): Var olan örnekleri bozarak/değiştirerek
+    çoğaltmak; modeli gürültüye dayanıklı yapar.
+BİZDE:
+  - Etiketler (JSON) kodla üretilir -> hatasız.
+  - Cümle çeşitliliğini büyük model üretir -> doğal Türkçe.
+  - STT hata taklidi -> gerçek dünya dayanıklılığı.
+  Sonuç: Büyük modelin Türkçe yetkinliği, 0.6B'lik hızlı modele taşınır.
+  Bu projenin "nasıl hem hızlı hem doğru" sorusunun cevabı budur.
+
+--------------------------------------------------------------------------------
+8.10 Fine-tune'da sık yapılan hatalar
+--------------------------------------------------------------------------------
+  - Eğitim ve kullanımda farklı sistem prompt'u / sohbet şablonu.
+  - Sadece temiz şablon cümleleriyle eğitmek (gerçek konuşmada çöker).
+  - Negatif örnek koymamak (model her şeye komut uydurur).
+  - Dengesiz veri (çok görülen komuta yatkınlık).
+  - Test setini eğitime sızdırmak.
+  - Baseline ölçmeden fine-tune'a girişmek (kazancı gösteremezsin).
+  - Hiperparametreyle oynamayı veri kalitesinin önüne koymak. Sıralama:
+    veri >> değerlendirme >> hiperparametre.
+
+--------------------------------------------------------------------------------
+8.11 STT için fine-tune
+--------------------------------------------------------------------------------
+NEDİR: Aynı mantık ses modellerine de uygulanır: (ses, doğru metin)
+  çiftleriyle Whisper'a LoRA.
+BİZDE: İsteğe bağlı, ileri seviye. Önce initial_prompt ve normalizasyonla
+  çöz; gürültülü ortamda (pervane sesi) doğruluk yetmezse düşün.
+
+
+================================================================================
+9. KONUM, KOORDİNAT VE HARİTA
+================================================================================
+
+--------------------------------------------------------------------------------
+9.1 Küresel ve yerel koordinat
+--------------------------------------------------------------------------------
+NEDİR:
+  Küresel: Enlem (kuzey-güney), boylam (doğu-batı), derece cinsinden;
+    + irtifa. GPS bunu verir. Standart: WGS84.
+  Yerel  : Bir başlangıç noktasına göre metre cinsinden (bizde NED).
+  İrtifa türleri: AMSL (deniz seviyesinden) ve AGL/göreli (kalkış
+    noktasından). Karıştırılırsa drone yanlış yüksekliğe gider.
+BİZDE: Haritadan gelen hedef küreseldir; PX4'e yerel setpoint veririz.
+  Arada dönüşüm gerekir.
+
+--------------------------------------------------------------------------------
+9.2 Enlem/boylam -> yerel metre dönüşümü
+--------------------------------------------------------------------------------
+NEDİR: Kısa mesafelerde (birkaç km) dünya düz kabul edilebilir:
+      kuzey (m) = (lat - ref_lat) * (pi/180) * R
+      dogu  (m) = (lon - ref_lon) * (pi/180) * R * cos(ref_lat)
+      R ≈ 6.371.000 m (dünya yarıçapı)
+  ref_lat/ref_lon: yerel sistemin orijini. PX4 bunu VehicleLocalPosition
+  mesajında verir.
+  Haversine: Küre üzerinde iki nokta arasındaki mesafe formülü; "en yakın"
+  hesabında kullanılır.
+BİZDE: enlem_boylam_to_ned fonksiyonu bu formülü uygular. Alternatif:
+  PX4'e doğrudan küresel hedef veren komut (DO_REPOSITION).
+
+--------------------------------------------------------------------------------
+9.3 Web API'leri
+--------------------------------------------------------------------------------
+NEDİR:
+  REST API : İnternet üzerinden HTTP isteğiyle veri alma. İstek atarsın,
+             JSON cevap gelir.
+  API anahtarı: Seni tanıtan gizli kod; ücretlendirme buna göre yapılır.
+             Koda ya da git'e konmaz; ortam değişkeninde tutulur.
+  Google Places API: Yer arama. Nearby Search (yakındaki X türü yerler),
+             Text Search (isimle arama).
+  Geocoding: Adres/isim -> koordinat.
+  OpenStreetMap / Overpass: Açık, ücretsiz harita verisi ve sorgu servisi.
+BİZDE: places_node drone'un konumunu + tür bilgisini API'ye gönderir,
+  en yakın yerin koordinatını alır. LLM bu sürecin içinde değildir; sadece
+  "hastane" kelimesini ve niyeti çıkarır. Bu, "araç kullanan LLM" kalıbının
+  en sade örneğidir: model ne istendiğini anlar, araç gerçeği bilir.
+
+
+================================================================================
+10. PERFORMANS VE ÖLÇÜM
+================================================================================
+
+--------------------------------------------------------------------------------
+10.1 Gecikme (latency) ve iş hacmi (throughput)
+--------------------------------------------------------------------------------
+NEDİR:
+  Gecikme : Tek bir isteğin baştan sona süresi.
+  İş hacmi: Birim zamanda işlenen istek sayısı.
+BİZDE: Tek kullanıcı, tek komut — bizi sadece GECİKME ilgilendirir.
+
+--------------------------------------------------------------------------------
+10.2 Uçtan uca gecikme ve bütçe
+--------------------------------------------------------------------------------
+NEDİR: Toplam gecikme = aşamaların toplamı. "Bütçe" her aşamaya ayrılan
+  süre payıdır.
+BİZDE: VAD bekleme + STT + ayrıştırma (hızlı yol ya da LLM) + doğrulama +
+  PX4 tepkisi. Ayrıca fark et: kullanıcının algıladığı "hız" ikiye ayrılır:
+    tepki süresi : drone ne kadar çabuk harekete BAŞLADI (bizim işimiz)
+    görev süresi : hareket ne kadar sürdü (PX4 hız parametreleri)
+
+--------------------------------------------------------------------------------
+10.3 Ortalama, p50, p95
+--------------------------------------------------------------------------------
+NEDİR: Ortalama, arada bir olan yavaş istekleri gizler.
+  p50 (medyan): isteklerin yarısı bundan hızlı.
+  p95: isteklerin %95'i bundan hızlı — "kötü günde" ne kadar yavaş.
+BİZDE: Hedefleri p95 ile de vereceğiz. "Ortalama 600 ms ama bazen 3 sn"
+  bir drone için kabul edilemez.
+
+--------------------------------------------------------------------------------
+10.4 Darboğaz ve "önce ölç" ilkesi
+--------------------------------------------------------------------------------
+NEDİR: Toplam süreyi en çok belirleyen aşama darboğazdır. Darboğaz
+  olmayan bir aşamayı iki kat hızlandırmak toplamı neredeyse hiç
+  değiştirmez (Amdahl yasasının özü).
+BİZDE: Sezgi "LLM yavaştır" der; ama doğru kurulmuş küçük modelde büyük
+  olasılıkla darboğaz VAD beklemesi ve STT olacak. Bunu tahmin etmeyeceğiz,
+  latency_monitor ile ölçeceğiz.
+
+--------------------------------------------------------------------------------
+10.5 Isınma, önbellek, hızlı yol
+--------------------------------------------------------------------------------
+NEDİR:
+  Soğuk başlangıç: İlk istek yavaştır (model yükleme, bellek ayırma).
+    Çözüm: açılışta sahte bir istekle ısıtmak.
+  Önbellek (cache): Aynı girdinin sonucunu saklayıp tekrar hesaplamamak.
+  Hızlı yol (fast path): Sık ve kolay durumları ucuz yöntemle çözüp pahalı
+    yöntemi sadece gerektiğinde kullanmak. Klasik bir sistem tasarımı
+    kalıbıdır.
+BİZDE: Üçü de var: STT ve LLM ısınması; prompt cache + sonuç önbelleği;
+  regex hızlı yolu.
+
+--------------------------------------------------------------------------------
+10.6 Hız-doğruluk takası
+--------------------------------------------------------------------------------
+NEDİR: Daha küçük model, daha agresif quantization, daha kısa VAD beklemesi,
+  beam_size=1 — hepsi hızlandırır, hepsi bir miktar doğruluk riski taşır.
+BİZDE: Her ayarı doğrulukla BİRLİKTE ölçeceğiz. Amaç "en hızlı" değil,
+  "doğruluk hedefini tutturan en hızlı" yapılandırma.
+
+
+================================================================================
+11. GÜVENLİK TASARIMI
+================================================================================
+
+--------------------------------------------------------------------------------
+11.1 Olasılıksal ve deterministik bileşenler
+--------------------------------------------------------------------------------
+NEDİR: STT ve LLM olasılıksaldır: çoğu zaman doğru, bazen yanlış ve ne
+  zaman yanılacağı öngörülemez. Klasik kod deterministiktir: aynı girdi,
+  aynı çıktı; test edilebilir.
+  İlke: Olasılıksal bileşenin çıktısı, fiziksel dünyayı etkilemeden önce
+  mutlaka deterministik bir kontrolden geçmeli.
+BİZDE: LLM -> JSON -> safety.py -> yürütücü. LLM ne üretirse üretsin,
+  limitlerin dışına çıkan komut drone'a ulaşmaz.
+
+--------------------------------------------------------------------------------
+11.2 Katmanlı savunma
+--------------------------------------------------------------------------------
+NEDİR: Tek bir önleme güvenmemek; biri kaçırırsa diğeri yakalar.
+BİZDE: Sırasıyla:
+    1) Şema kısıtı        (biçim bozuk olamaz)
+    2) "bilinmiyor" sınıfı (alakasız cümle komut olmaz)
+    3) Güvenlik katmanı   (limit, geofence, durum, batarya)
+    4) Sesli onay         (riskli komutlarda insan döngüde)
+    5) PX4 failsafe/geofence (bizim yazılım çökse bile)
+    6) Acil "dur"         (her zaman, LLM'siz, en hızlı yoldan)
+
+--------------------------------------------------------------------------------
+11.3 İnsan döngüde (human in the loop)
+--------------------------------------------------------------------------------
+NEDİR: Kritik kararlarda son onayı insana bırakmak.
+BİZDE: Uzak hedef, düşük STT güveni ya da alışılmadık komutta "onaylıyor
+  musun?" sorusu. Gecikme ekler; bu yüzden sadece riskli komutlarda.
+
+--------------------------------------------------------------------------------
+11.4 Güvenli varsayılan
+--------------------------------------------------------------------------------
+NEDİR: Belirsizlikte en az zararlı davranışı seçmek.
+BİZDE: Anlaşılmayan komut -> hiçbir şey yapma (asılı kal). LLM sunucusu
+  cevap vermiyor -> komutu düşür, bildir. Harita sonuç vermedi -> gitme.
+  Bir drone için "hiçbir şey yapmamak" (havada asılı kalmak) neredeyse her
+  zaman en güvenli seçenektir.
+
+
+================================================================================
+12. MİNİ SÖZLÜK
+================================================================================
+  Action          ROS 2'de uzun süren, iptal edilebilir görev arayüzü
+  AGL / AMSL      Yerden / deniz seviyesinden yükseklik
+  Arm             Motorları devreye alma
+  ASR / STT       Konuşmadan metne
+  Baseline        Kıyas için alınan ilk ölçüm
+  Batch           Tek güncellemede kullanılan örnek sayısı
+  Callback        Olay olunca çağrılan fonksiyon
+  Chat template   Rollerin modele verildiği biçim
+  colcon          ROS 2 derleme aracı
+  DDS             ROS 2'nin altındaki haberleşme standardı
+  Distillation    Büyük modelin bilgisini küçüğe aktarma
+  EKF             Sensörleri birleştirip durum tahmin eden filtre
+  Epoch           Verinin bir kez baştan sona görülmesi
+  Failsafe        Arıza durumundaki otomatik güvenli davranış
+  Few-shot        Prompt içinde birkaç örnek verme
+  Fine-tune       Hazır modeli kendi verinle uyarlama
+  Function calling Modelin fonksiyon çağrısı tarif etmesi
+  Geofence        Sanal sınır
+  GGUF            llama.cpp model dosya formatı
+  Halüsinasyon    Modelin uydurma içerik üretmesi
+  Headless        Ekransız çalıştırma
+  Inference       Eğitilmiş modeli kullanarak çıktı üretme
+  JSONL           Her satırı bir JSON olan dosya
+  KV-cache        İşlenmiş girdinin saklanan ara sonuçları
+  Launch          Birçok node'u birlikte başlatan dosya
+  Learning rate   Parametre güncelleme adım büyüklüğü
+  LoRA            Küçük adaptörlerle verimli fine-tune
+  Loss            Model hatasının sayısal ölçüsü
+  MAVLink         Drone-yer istasyonu protokolü
+  NED             Kuzey-Doğu-Aşağı koordinat sistemi
+  Node            ROS 2'de çalışan program birimi
+  Offboard        Hedeflerin dış bilgisayardan verildiği PX4 modu
+  Overfitting     Ezberleme; yeni veride başarısızlık
+  p95             İsteklerin %95'inin altında kaldığı süre
+  Prompt          Modele verilen girdi/talimat
+  QGC             QGroundControl yer istasyonu
+  QoS             ROS 2 topic teslimat kuralları
+  Quantization    Model sayılarını daha az bitle saklama
+  RTF             Gerçek zaman faktörü (simülasyon ya da STT için)
+  RTL             Kalkış noktasına dönüş
+  SDF             Gazebo dünya/model tanım formatı
+  Service         ROS 2'de istek-cevap arayüzü
+  Setpoint        Kontrolcüye verilen hedef değer
+  SITL            Autopilot'un bilgisayarda simüle çalışması
+  Temperature     Üretimdeki rastgelelik ayarı
+  Token           Modelin gördüğü metin parçası
+  Topic           ROS 2'de adlandırılmış veri kanalı
+  TTS             Metinden konuşmaya
+  uORB            PX4'ün iç mesajlaşma sistemi
+  uXRCE-DDS       PX4 ile ROS 2 arasındaki köprü
+  VAD             Konuşma var/yok tespiti
+  WER / CER       Kelime / karakter hata oranı
+  Yaw             Drone'un burun yönü (dikey eksende dönüş)
+
+================================================================================
+  OKUMA SIRASI ÖNERİSİ
+  Faz 0-1 öncesi : Bölüm 1, 2, 3, 4, 5
+  Faz 2 öncesi   : Bölüm 7
+  Faz 3 öncesi   : Bölüm 6
+  Faz 4 öncesi   : Bölüm 8 (iki kez oku; fazın tamamı buna dayanıyor)
+  Faz 5 öncesi   : Bölüm 9
+  Faz 6 öncesi   : Bölüm 10, 11
+================================================================================

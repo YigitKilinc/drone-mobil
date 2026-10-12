@@ -1,0 +1,875 @@
+================================================================================
+  TÜRKÇE SESLİ KOMUTLA DRONE KONTROLÜ — MİMARİ TASARIM DOKÜMANI
+  (Gazebo Jetty + ROS 2 Lyrical + PX4 + yerel fine-tune'lu küçük LLM)
+  Tarih: 7 Ekim 2026
+================================================================================
+
+İÇİNDEKİLER
+  1.  Özet ve hedefler
+  2.  Genel mimari (büyük resim)
+  3.  Bileşenler: nerede, ne, nasıl
+  4.  LLM <-> drone bağlantısı (komut şeması ve akış)
+  5.  ROS 2 paket ve klasör yapısı
+  6.  Fine-tune nedir, nasıl yapılır (sıfırdan)
+  7.  Veri: nereden bulunur, nasıl üretilir
+  8.  Google Maps entegrasyonu ("en yakın hastaneye git")
+  9.  Hız ve performans
+  10. Hazır kullanabileceğin projeler ve araçlar
+  11. Yol haritası (fazlar)
+  12. Geliştirme fikirleri
+  13. Riskler ve dikkat edilecekler
+  14. Kaynaklar
+
+
+================================================================================
+1. ÖZET VE HEDEFLER
+================================================================================
+
+Ne yapıyoruz:
+  Kullanıcı Türkçe konuşur ("500 metre yüksel", "sağa dön", "en yakın hastaneye
+  git"). Sistem sesi yazıya çevirir, yazıyı yapılandırılmış bir komuta çevirir,
+  komutu güvenlik kontrolünden geçirir ve simülasyondaki PX4 drone'una uygular.
+
+Alınan kararlar:
+  - İşletim sistemi : Ubuntu 26.04 (ROS 2 Lyrical'ın resmi platformu)
+  - Simülatör       : Gazebo Jetty
+  - Uçuş kontrolcüsü: PX4 (SITL = yazılımla simüle edilen autopilot)
+  - Ara katman      : ROS 2 Lyrical, PX4 ile uXRCE-DDS köprüsü üzerinden
+  - Ses tanıma      : Yerel Türkçe STT (Whisper ailesi ya da küçük akışlı model)
+  - LLM             : Yerelde çalışan, fine-tune edilmiş KÜÇÜK model (0.3–2B)
+  - Dil             : Sadece Türkçe
+
+Hız hedefi (konuşmanın bitmesinden drone'un harekete başlamasına kadar):
+  - GPU'lu makinede : 1 saniyenin altı
+  - Sadece CPU      : 2 saniyenin altı
+  - "DUR" gibi acil komutlar: 300 ms civarı (LLM'e hiç uğramadan)
+  Bu rakamlar hedeftir, ölçüm değildir. Bölüm 9'da nasıl ölçeceğin anlatılıyor.
+
+En önemli üç tasarım ilkesi:
+  (1) LLM motoru sürmez. LLM yalnızca küçük bir JSON üretir ("ne yapılsın").
+      "Nasıl yapılsın" kısmı klasik, deterministik koddur. Böylece hem hızlı
+      hem güvenli olur; LLM saçmalasa bile drone saçmalamaz.
+  (2) Basit komutlar LLM'e gitmez. "dur", "in", "500 metre yüksel" gibi kalıp
+      komutlar kural tabanlı ayrıştırıcıyla 5 ms'nin altında çözülür. LLM
+      sadece serbest/karmaşık cümleler için devreye girer.
+  (3) Her aşama ölçülür. Hız en önemli kriter olduğu için her mesaja zaman
+      damgası konur; darboğaz tahminle değil ölçümle bulunur.
+
+
+================================================================================
+2. GENEL MİMARİ (BÜYÜK RESİM)
+================================================================================
+
+  [Mikrofon]
+      |  ham ses (16 kHz, mono)
+      v
+  [VAD - konuşma algılama]            Silero VAD: konuşma başladı/bitti
+      |  sadece konuşma içeren ses parçası
+      v
+  [STT - sesi yazıya çevirme]         faster-whisper (GPU) / küçük model (CPU)
+      |  "beş yüz metre yüksel"
+      v
+  [Normalizasyon]                     "beş yüz metre" -> "500 m", küçük harf
+      |  "500 m yüksel"
+      v
+  [ACİL KELİME KONTROLÜ] --"dur/acil/iptal"--> doğrudan DUR komutu (LLM yok)
+      |
+      v
+  [HIZLI YOL - kural tabanlı]  --eşleşti--> JSON komut (5 ms altı)
+      |  eşleşmedi
+      v
+  [KÜÇÜK LLM - fine-tune'lu]          llama.cpp server, kısıtlı JSON çıktı
+      |  {"komut":"yuksel","metre":500}
+      v
+  [DOĞRULAYICI + GÜVENLİK]            şema, limitler, geofence, batarya
+      |  onaylı komut
+      v
+  [GÖREV YÜRÜTÜCÜ]  <----> [HARİTA ARAÇLARI] (Google Places / OSM)
+      |  hedef konum / hız setpoint'leri (20-50 Hz)
+      v
+  [uXRCE-DDS köprüsü]                 MicroXRCEAgent (UDP 8888)
+      |
+      v
+  [PX4 SITL]                          uçuş kontrolü, failsafe
+      |
+      v
+  [Gazebo Jetty]                      fizik + sensör + görselleştirme
+
+  Geri besleme yolu:
+  Gazebo -> PX4 -> ROS 2 telemetri (konum, hız, batarya, durum)
+         -> Görev yürütücü (komut bitti mi?) -> isteğe bağlı TTS ile sesli yanıt
+            ("500 metreye yükseliyorum")
+
+Katmanların sorumluluğu:
+  Algı katmanı   : VAD + STT            (ses -> metin)
+  Anlama katmanı : hızlı yol + LLM      (metin -> niyet/JSON)
+  Karar katmanı  : doğrulayıcı + yürütücü (JSON -> uçuş hedefleri)
+  Kontrol katmanı: PX4                  (hedef -> motor)
+  Dünya          : Gazebo               (fizik)
+
+
+================================================================================
+3. BİLEŞENLER: NEREDE, NE, NASIL
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 Gazebo Jetty — "dünya"
+--------------------------------------------------------------------------------
+Görevi : Drone'un fiziğini, sensörlerini (IMU, GPS, barometre, kamera) ve
+         ortamı simüle eder. Drone gerçekte burada "uçar".
+Nasıl  : PX4 kendi Gazebo modelleriyle gelir. Tipik başlatma:
+             cd PX4-Autopilot
+             make px4_sitl gz_x500
+         Bu tek komut hem PX4 SITL'i hem Gazebo'yu x500 quadcopter ile açar.
+Harita için önemli ayar:
+         Simülasyonun başlangıç noktasını gerçek bir koordinata koy, yoksa
+         "en yakın hastane" anlamsız olur. Örnek (Ankara, Kızılay civarı):
+             export PX4_HOME_LAT=39.9208
+             export PX4_HOME_LON=32.8541
+             export PX4_HOME_ALT=850
+Ekransız (headless) çalıştırma: uzak makinede GUI'siz çalıştırmak hem RAM hem
+         CPU kazandırır:  HEADLESS=1 make px4_sitl gz_x500
+
+--------------------------------------------------------------------------------
+3.2 PX4 — "pilot"
+--------------------------------------------------------------------------------
+Görevi : Dengeleme, konum tutma, motor kontrolü, failsafe (bağlantı koparsa
+         eve dön vb.). Sen "şu noktaya git" dersin, PX4 nasıl gideceğini bilir.
+Kullanacağın mod: OFFBOARD. Bu modda hedefleri dışarıdan (ROS 2'den) verirsin.
+Offboard'un iki kuralı (en sık takılınan yer):
+  - Offboard'a geçmeden ÖNCE setpoint akışı başlamış olmalı ve en az 2 Hz
+    kesintisiz devam etmeli. Akış kesilirse PX4 offboard'dan çıkar (failsafe).
+    Pratikte 20–50 Hz yayınla.
+  - PX4 koordinat sistemi NED'dir (North-East-Down). Z ekseni AŞAĞI bakar.
+    500 m yukarı = z: -500. Yaw 0 = kuzey, saat yönünde artar (radyan).
+Hız için ayarlanacak parametreler (QGroundControl ya da param set ile):
+    MPC_Z_VEL_MAX_UP  : maksimum tırmanma hızı (varsayılan ~3 m/s)
+    MPC_Z_VEL_MAX_DN  : maksimum alçalma hızı
+    MPC_XY_VEL_MAX    : maksimum yatay hız
+    MPC_ACC_HOR       : yatay ivme
+    GF_MAX_VER_DIST / GF_MAX_HOR_DIST : geofence (dikey/yatay sınır)
+  Not: 500 m tırmanış varsayılan 3 m/s ile ~3 dakika sürer. "Drone hızlı
+  olsun" istiyorsan asıl kazanç LLM'de değil bu parametrelerdedir.
+
+--------------------------------------------------------------------------------
+3.3 uXRCE-DDS köprüsü — "PX4 ile ROS 2 arasındaki kablo"
+--------------------------------------------------------------------------------
+Görevi : PX4'ün iç mesajlarını (uORB) ROS 2 topic'lerine çevirir. MAVROS'a
+         gerek kalmaz, gecikme düşüktür.
+Nasıl  : Ayrı bir terminalde ajanı çalıştır:
+             MicroXRCEAgent udp4 -p 8888
+         ROS 2 tarafında px4_msgs paketini workspace'ine ekleyip derle.
+         ÖNEMLİ: px4_msgs sürümü, kullandığın PX4 sürümüyle aynı dal olmalı.
+Kullanacağın topic'ler:
+    Yazdıkların (ROS 2 -> PX4):
+      /fmu/in/offboard_control_mode   (OffboardControlMode)  "konum mu hız mı"
+      /fmu/in/trajectory_setpoint     (TrajectorySetpoint)   hedef konum/hız/yaw
+      /fmu/in/vehicle_command         (VehicleCommand)       arm, mod değiştir, in
+    Okudukların (PX4 -> ROS 2):
+      /fmu/out/vehicle_local_position  yerel konum (NED, metre)
+      /fmu/out/vehicle_global_position enlem/boylam/irtifa
+      /fmu/out/vehicle_status          arm durumu, mod, failsafe
+      /fmu/out/battery_status          batarya
+    (Yeni PX4 sürümlerinde bazı topic adlarının sonunda _v1 gibi sürüm eki
+     olabilir; `ros2 topic list` ile kontrol et.)
+QoS tuzağı: PX4 topic'leri "best effort" yayınlanır. Subscriber'ını varsayılan
+         (reliable) QoS ile açarsan HİÇ mesaj gelmez. Subscriber QoS:
+         reliability=BEST_EFFORT, durability=TRANSIENT_LOCAL, depth=1.
+
+--------------------------------------------------------------------------------
+3.4 ROS 2 Lyrical — "sinir sistemi"
+--------------------------------------------------------------------------------
+Görevi : Tüm parçaları (ses, LLM, yürütücü, harita) birbirine bağlayan mesaj
+         altyapısı. Her parça ayrı bir "node"; topic/action ile konuşurlar.
+Neden ayrı node'lar: biri çökerse diğerleri yaşar, her biri ayrı ölçülür,
+         STT'yi değiştirmek LLM koduna dokunmayı gerektirmez.
+Dil seçimi: Ses/LLM node'ları Python (kütüphaneler orada). Görev yürütücü
+         Python ile başla; 50 Hz döngüde sorun görürsen C++'a taşı.
+
+--------------------------------------------------------------------------------
+3.5 VAD (konuşma algılama)
+--------------------------------------------------------------------------------
+Görevi : Sürekli akan mikrofon sesinde "konuşma başladı / bitti" anını bulur.
+         STT'ye sessizlik gönderilmez.
+Araç   : Silero VAD (çok küçük, CPU'da 1 ms altı).
+Hız etkisi büyük: "Konuşma bitti" demek için beklenen sessizlik süresi
+         doğrudan gecikmene eklenir. 700 ms beklersen her komut 700 ms
+         gecikir. Kısa komutlar için 250–350 ms dene.
+
+--------------------------------------------------------------------------------
+3.6 STT (sesi yazıya çevirme)
+--------------------------------------------------------------------------------
+GPU varsa : faster-whisper + whisper-large-v3-turbo. Türkçe için fine-tune
+            edilmiş CTranslate2 sürümleri Hugging Face'te mevcut. float16.
+            Kısa komutta ~150–300 ms beklenir.
+GPU yoksa : (a) whisper "small" int8 (CPU'da ~0.5–1 sn),
+            (b) CPU için tasarlanmış küçük akışlı Türkçe modeller
+                (sherpa-onnx tabanlı zipformer vb., ~70 MB, gerçek zamanlıdan
+                 birkaç kat hızlı). Doğruluk biraz düşer, hız çok artar.
+Ayarlar   : language="tr" sabitle (dil algılama adımı atlanır),
+            beam_size=1 (hız), initial_prompt'a drone sözlüğünü yaz
+            ("yüksel, alçal, metre, kalkış, iniş, hastane...") — Whisper bu
+            kelimelere yatkınlaşır.
+Normalizasyon (STT'den sonra, küçük bir Python fonksiyonu):
+            "beş yüz metre" -> 500 m ; "yüz elli" -> 150 ; "mt/metre/m" -> m
+            "doksan derece" -> 90° ; küçük harf, noktalama temizliği.
+            Sayıları LLM'e bırakma; burada kesin çevir.
+
+--------------------------------------------------------------------------------
+3.7 LLM (metni komuta çevirme)
+--------------------------------------------------------------------------------
+Bu görev için hangi LLM uygun?
+  Görev çok dar: kısa bir Türkçe cümleyi ~12 komuttan birine ve birkaç
+  parametreye eşlemek. Bunun için büyük model gereksiz ve yavaş. Doğru seçim:
+  KÜÇÜK bir modeli bu göreve fine-tune etmek.
+
+  Adaylar (küçükten büyüğe):
+    FunctionGemma 270M : Fonksiyon çağırma için eğitilmiş, çok hızlı, ~0.5 GB
+                         RAM. Fine-tune edilmek üzere tasarlanmış. Türkçesi
+                         zayıf başlar, fine-tune ile düzelir.
+    Qwen3 0.6B         : Hız/doğruluk dengesi iyi. Türkçe function calling
+                         için fine-tune edildiğinde iyi sonuç verdiği
+                         topluluk tarafından raporlanıyor. ÖNERİLEN BAŞLANGIÇ.
+    Qwen3 1.7B         : Karmaşık/çok adımlı cümlelerde daha sağlam, ~2-3 kat
+                         yavaş. 0.6B yetmezse buna çık.
+    Gemma 3 1B         : Türkçesi görece iyi, alternatif.
+  Strateji: Hepsini aynı test setiyle ölç (doğruluk + gecikme), tabloya dök,
+  en küçük "yeterince doğru" modeli seç. Yarışma raporu için de güzel içerik.
+  Not: Model sürümleri hızlı değişiyor; kurulum günü Hugging Face'te bu
+  boyut sınıfındaki güncel sürümlere bak.
+
+Nasıl çalıştırılır:
+  - Format   : GGUF, Q4_K_M quantization (4-bit; hız/doğruluk dengesi).
+  - Sunucu   : llama.cpp'nin llama-server'ı. Model bir kez yüklenir, hep
+               bellekte kalır. Örnek:
+                 llama-server -m drone-qwen3-0.6b-q4.gguf --port 8080 \
+                              -c 1024 -ngl 99        (GPU yoksa -ngl 0)
+  - Ollama da olur (kolay), ama llama-server grammar ve cache ayarlarında
+    daha fazla kontrol verir; hız için onu öneririm.
+  - KISITLI ÇIKTI (çok önemli): İsteğe json_schema (ya da GBNF grammar) ekle.
+    Model şemaya uymayan token üretemez -> çıktı %100 geçerli JSON olur,
+    gereksiz açıklama yazamaz, daha az token = daha hızlı.
+  - temperature=0, max_tokens ~64, cache_prompt=true (sistem prompt'u her
+    seferinde yeniden işlenmez).
+  - Qwen3'te "thinking" modunu kapat (/no_think); düşünme token'ları
+    gecikmeyi katlar.
+
+--------------------------------------------------------------------------------
+3.8 Doğrulayıcı ve güvenlik katmanı
+--------------------------------------------------------------------------------
+LLM çıktısı drone'a gitmeden önce düz Python koduyla kontrol edilir:
+  - Şema doğru mu, komut bilinen bir komut mu?
+  - Limitler: maksimum irtifa, maksimum tek-komut mesafesi, hız sınırı.
+  - Geofence: hedef izinli alanın içinde mi?
+  - Durum: drone arm değilken "ileri git" gelirse reddet ya da önce kalk.
+  - Batarya: hedefe gidip dönmeye yeter mi (basit tahmin)?
+  - Tehlikeli/şüpheli komut (çok uzak hedef, düşük STT güveni): sesli onay iste
+    ("2 kilometre uzaktaki hastaneye gidiyorum, onaylıyor musun?").
+Reddedilen komut için sebep döndür; TTS ile kullanıcıya söyle.
+
+--------------------------------------------------------------------------------
+3.9 Görev yürütücü (mission executor)
+--------------------------------------------------------------------------------
+Görevi : Onaylı JSON komutu PX4 setpoint'lerine çevirir ve bitene kadar izler.
+İç yapı: Küçük bir durum makinesi:
+           BEKLEMEDE -> ARM -> KALKIŞ -> HAVADA_BEKLE <-> KOMUT_YÜRÜT -> İNİŞ
+         Arka planda 20–50 Hz zamanlayıcı sürekli "şu anki hedefi" yayınlar
+         (offboard akışı hiç kesilmesin diye). Yeni komut gelince sadece
+         hedef değişkeni güncellenir.
+Komut -> PX4 eşlemesi (örnekler):
+    kalk           : arm + offboard + hedef z = -(varsayılan irtifa)
+    yuksel 500     : hedef.z = mevcut.z - 500
+    irtifaya_cik 500: hedef.z = -500
+    git ileri 100  : yaw'a göre gövde ekseninden NED'e çevir, hedef.xy güncelle
+    don sag 90     : hedef.yaw = mevcut.yaw + pi/2
+    git_koordinat  : enlem/boylamı yerel NED'e çevir (VehicleLocalPosition
+                     içindeki ref_lat/ref_lon referansıyla) ya da
+                     VEHICLE_CMD_DO_REPOSITION kullan
+    in             : VEHICLE_CMD_NAV_LAND
+    eve_don        : VEHICLE_CMD_NAV_RETURN_TO_LAUNCH
+    dur            : hedef = mevcut konum (anında fren, havada asılı kal)
+"Bitti" ölçütü: hedefe mesafe < eşik (örn. 0.5 m) ve hız düşük.
+Çok adımlı komutlar: bir kuyruk tut; biri bitince sıradakine geç.
+Kesme: yeni komut varsayılan olarak eskisini iptal edip yerine geçer;
+       "sonra" / "ardından" derse kuyruğa eklenir.
+
+--------------------------------------------------------------------------------
+3.10 TTS (isteğe bağlı sesli yanıt)
+--------------------------------------------------------------------------------
+Piper (Türkçe ses modelleri var, CPU'da çok hızlı). Sık cümleleri ("Anlaşıldı",
+"İniyorum") önceden ses dosyası olarak üret; anında çalar. TTS çalarken
+mikrofonu sustur, yoksa drone kendi sesini komut sanar.
+
+
+================================================================================
+4. LLM <-> DRONE BAĞLANTISI (KOMUT ŞEMASI VE AKIŞ)
+================================================================================
+
+LLM ile drone arasındaki "sözleşme" küçük bir JSON şemasıdır. LLM'in tek işi
+bu JSON'u üretmektir.
+
+Komut listesi (başlangıç seti):
+  kalk            {irtifa_m?}
+  in              {}
+  yuksel          {metre}                    göreli: mevcut + metre
+  alcal           {metre}
+  irtifaya_cik    {metre}                    mutlak: yerden metre
+  git_yon         {yon: ileri|geri|sag|sol|kuzey|guney|dogu|bati, metre}
+  don             {yon: sag|sol, derece}
+  git_koordinat   {enlem, boylam, irtifa_m?}
+  yakin_yere_git  {tur: hastane|eczane|benzinlik|..., }   (harita aracı)
+  bekle           {saniye}
+  hiz_ayarla      {mps}
+  eve_don         {}
+  dur             {}
+  bilinmiyor      {}                         alakasız/anlaşılmayan cümle
+
+Çıktı formatı (tek ya da çok adım, hep liste):
+  "500 metre yüksel"
+     -> {"adimlar":[{"komut":"yuksel","metre":500}]}
+  "önce 50 metre yüksel sonra kuzeye 200 metre git"
+     -> {"adimlar":[{"komut":"yuksel","metre":50},
+                    {"komut":"git_yon","yon":"kuzey","metre":200}]}
+  "en yakın hastaneye git"
+     -> {"adimlar":[{"komut":"yakin_yere_git","tur":"hastane"}]}
+  "bugün hava nasıl"
+     -> {"adimlar":[{"komut":"bilinmiyor"}]}
+
+Dikkat edilecek dil inceliği: "500 metre yüksel" (göreli) ile "500 metreye
+çık" (mutlak) farklı komutlardır. Veri setinde ikisini de bolca örnekle.
+
+Anahtarları kısa tut: Her fazladan token gecikmedir. İstersen fine-tune
+aşamasında anahtarları daha da kısalt ("k","m","y").
+
+ROS 2 üzerindeki akış:
+  voice_input      --/voice/text (String + zaman damgası)-->   command_parser
+  command_parser   --/drone/command (DroneCommand listesi)-->  mission_executor
+  mission_executor --/fmu/in/* (px4_msgs)-->                   PX4
+  PX4              --/fmu/out/* -->                            mission_executor
+  mission_executor --/drone/feedback (durum, metin)-->         tts / panel
+  herhangi biri    --/drone/emergency_stop (Empty)-->          mission_executor
+
+command_parser node'unun LLM'e bağlanması: llama-server'a localhost üzerinden
+HTTP isteği (OpenAI uyumlu /v1/chat/completions). Bağlantıyı açık tut
+(keep-alive); her istekte yeniden bağlanma.
+
+
+================================================================================
+5. ROS 2 PAKET VE KLASÖR YAPISI
+================================================================================
+
+llm_drone/
+├── MIMARI.txt                      (bu dosya)
+├── docker/
+│   ├── Dockerfile                  Ubuntu 26.04 + ROS 2 Lyrical + Gazebo Jetty
+│   └── docker-compose.yml          sim, agent, llm-server servisleri
+├── ros2_ws/
+│   └── src/
+│       ├── px4_msgs/               (git ile eklenir, PX4 sürümüyle aynı dal)
+│       ├── drone_interfaces/       özel mesaj/action tanımları
+│       │   ├── msg/DroneCommand.msg, CommandList.msg, Feedback.msg
+│       │   └── action/ExecuteCommand.action
+│       ├── voice_input/            mikrofon + VAD + STT + normalizasyon
+│       │   └── stt_node.py         yayın: /voice/text
+│       ├── command_parser/         acil kelime + hızlı yol + LLM istemcisi
+│       │   ├── fast_path.py        regex kuralları
+│       │   ├── llm_client.py       llama-server HTTP istemcisi
+│       │   └── parser_node.py      abone: /voice/text, yayın: /drone/command
+│       ├── mission_executor/       güvenlik + durum makinesi + PX4 offboard
+│       │   ├── safety.py
+│       │   ├── px4_interface.py    arm, mod, setpoint, NED dönüşümleri
+│       │   └── executor_node.py
+│       ├── map_tools/              Google Places / OSM sorguları
+│       │   └── places_node.py      servis: /map/find_nearest
+│       ├── voice_output/           Piper TTS (isteğe bağlı)
+│       ├── latency_monitor/        aşama aşama gecikme ölçümü ve kayıt
+│       └── drone_bringup/          launch dosyaları, parametre YAML'ları
+├── finetune/
+│   ├── data_gen/                   şablonlar, üretim ve artırma betikleri
+│   ├── data/                       train.jsonl, val.jsonl, test.jsonl
+│   ├── train/                      Unsloth eğitim not defteri/betiği
+│   ├── eval/                       doğruluk + gecikme kıyaslama betikleri
+│   └── models/                     LoRA adaptörleri ve GGUF çıktıları
+└── recordings/                     kendi ses kayıtların (STT testi için)
+
+Çalışan süreçler (hepsi aynı makinede):
+  1) PX4 SITL + Gazebo        make px4_sitl gz_x500
+  2) MicroXRCEAgent           udp4 -p 8888
+  3) llama-server             port 8080, model bellekte
+  4) ROS 2 node'ları          ros2 launch drone_bringup all.launch.py
+  5) (isteğe bağlı) QGroundControl — haritada izlemek ve parametre ayarı için
+
+
+================================================================================
+6. FINE-TUNE NEDİR, NASIL YAPILIR (SIFIRDAN)
+================================================================================
+
+--------------------------------------------------------------------------------
+6.1 Fine-tune nedir?
+--------------------------------------------------------------------------------
+Bir LLM, internetteki devasa metinle "genel" eğitilmiştir. Her şeyden biraz
+bilir ama senin işini özel olarak bilmez. Fine-tune, bu hazır modeli alıp
+KENDİ örneklerinle (girdi -> beklenen çıktı çiftleri) kısa bir ek eğitimden
+geçirmektir. Model sıfırdan eğitilmez; var olan bilgisi senin görevine doğru
+"eğilir".
+
+Benzetme: Genel kültürlü birini işe alıp iki gün boyunca sadece "şu cümle
+gelirse şu formu doldur" diye çalıştırmak.
+
+Üç yöntemin farkı:
+  Prompt yazmak : Modele her seferinde uzun talimat + örnek verirsin. Eğitim
+                  yok, ama prompt uzun (yavaş) ve küçük modeller tutarsız.
+  RAG           : Modele soru anında belge getirirsin. Bilgi eksikliği için.
+                  Bu projede gereği yok.
+  Fine-tune     : Davranış modelin ağırlıklarına işlenir. Prompt çok kısalır,
+                  küçük model büyük model gibi davranır. HIZ için doğru yol.
+
+Bu projede fine-tune'un sana kazandırdığı:
+  - 0.6B'lik model, bu dar görevde 8B'lik hazır model kadar doğru olabilir.
+  - Sistem prompt'u 500 token yerine 30 token olur.
+  - Türkçe günlük konuşma, devrik cümle, STT hataları öğretilebilir.
+
+--------------------------------------------------------------------------------
+6.2 LoRA / QLoRA nedir?
+--------------------------------------------------------------------------------
+Modelin tüm ağırlıklarını güncellemek pahalıdır. LoRA, asıl ağırlıkları
+dondurur ve yanlarına çok küçük ek matrisler ("adaptör") koyup sadece onları
+eğitir. Eğitilen parametre sayısı modelin %1'i civarıdır.
+  - Az bellek, hızlı eğitim (küçük modelde ücretsiz Colab T4'te dakikalar).
+  - Çıktı birkaç MB'lık bir adaptör dosyası; sonra asıl modelle birleştirilir.
+QLoRA = modeli 4-bit yükleyip LoRA yapmak (daha da az bellek).
+
+--------------------------------------------------------------------------------
+6.3 Adım adım süreç
+--------------------------------------------------------------------------------
+ADIM 0 — Önce fine-tune'SUZ ölç (baseline)
+  Ham modeli iyi bir prompt + JSON şema kısıtıyla test setinde çalıştır.
+  Doğruluk ve gecikmeyi not et. Fine-tune'un ne kazandırdığını ancak böyle
+  görürsün. (Zaten Faz 2'de sistemi bu haliyle uçtan uca çalıştıracaksın.)
+
+ADIM 1 — Veri setini hazırla (Bölüm 7)
+  Format: her satır bir sohbet örneği (JSONL):
+    {"messages":[
+      {"role":"system","content":"Drone komutunu JSON'a çevir."},
+      {"role":"user","content":"500 metre yüksel"},
+      {"role":"assistant","content":"{\"adimlar\":[{\"komut\":\"yuksel\",\"metre\":500}]}"}
+    ]}
+  Böl: %80 train, %10 val, %10 test. Test setine eğitimde HİÇ dokunma.
+  Sistem prompt'u eğitimde ne ise kullanımda da BİREBİR aynı olmalı.
+
+ADIM 2 — Ortam
+  GPU'n yoksa sorun değil: Google Colab ya da Kaggle (ücretsiz T4 GPU) bu
+  boyuttaki modeller için fazlasıyla yeterli. Kütüphane: Unsloth (LoRA
+  fine-tune'u birkaç hücreye indirir; hazır not defterleri var).
+
+ADIM 3 — Eğitim (başlangıç ayarları)
+    taban model       : Qwen3 0.6B (talimat/sohbet sürümü)
+    LoRA r            : 16
+    LoRA alpha        : 16–32
+    öğrenme oranı     : 2e-4
+    epoch             : 2–3
+    batch boyutu      : 16 (gerekirse 8 + gradient accumulation 2)
+    max_seq_length    : 256–512 (örnekler kısa; küçük tut, hızlanır)
+  Eğitimde yalnızca "assistant" cevabı üzerinden kayıp hesaplat
+  (Unsloth'ta train_on_responses_only).
+
+ADIM 4 — İzle
+  train loss düşerken val loss yükselmeye başlarsa ezberliyor (overfit):
+  epoch'u azalt ya da veriyi çeşitlendir.
+
+ADIM 5 — Değerlendir (loss'a değil, gerçek metriğe bak)
+  Test setinde:
+    - Tam eşleşme doğruluğu : üretilen JSON == beklenen JSON (yüzde)
+    - Komut doğruluğu       : en azından komut adı doğru mu
+    - Parametre doğruluğu   : sayılar/yönler doğru mu
+    - Yanlış kabul oranı    : alakasız cümleye komut üretti mi (tehlikeli olan)
+    - Gecikme               : ortalama ve en kötü %5 (p95)
+  Hataları tek tek oku; hangi tür cümlede yanılıyorsa o türden veri ekle,
+  tekrar eğit. Fine-tune tek seferlik değil, döngüdür.
+
+ADIM 6 — Dışa aktar
+  Adaptörü modelle birleştir -> GGUF'a çevir -> Q4_K_M quantize et
+  (Unsloth'ta tek fonksiyon). Q4 ile Q8'i test setinde kıyasla; doğruluk
+  aynıysa Q4 kullan.
+
+ADIM 7 — Servis et
+  GGUF'u llama-server'a ver, command_parser bu sunucuya bağlansın.
+
+--------------------------------------------------------------------------------
+6.4 STT'yi fine-tune etmek (ileri seviye, isteğe bağlı)
+--------------------------------------------------------------------------------
+Whisper belirli kelimeleri sürekli yanlış duyuyorsa kendi ses kayıtlarınla
+(birkaç saatlik komut kaydı) Whisper'a da LoRA fine-tune yapılabilir. Önce
+initial_prompt + normalizasyon ile çözmeyi dene; çoğu zaman yeter.
+
+
+================================================================================
+7. VERİ: NEREDEN BULUNUR, NASIL ÜRETİLİR
+================================================================================
+
+Gerçek durum: Hazır, açık bir "Türkçe drone sesli komut" veri seti yok. Bu
+kötü haber değil; görev dar olduğu için veriyi kendin üretmek hem kolay hem
+daha kaliteli. Hedef: 3.000–10.000 örnek.
+
+Üretim yöntemi (finetune/data_gen altında betiklerle):
+
+(1) Şablon + parametre çaprazlama (temel, garantili doğru etiket)
+    Şablonlar : "{n} metre yüksel", "{n} metre yukarı çık", "{n} m tırman",
+                "irtifayı {n} metre artır", "yukarı {n} metre" ...
+    Parametre : n = 1..1000 arası rastgele, yönler, dereceler, yer türleri
+    Etiket kodla üretildiği için hatasızdır.
+
+(2) Büyük LLM ile çeşitlendirme (paraphrase)
+    Güçlü bir modele (bulut API ya da büyük yerel model) her komut için
+    "bunu 20 farklı doğal Türkçe söyleyişle yaz: günlük dil, devrik cümle,
+    kibar/emir kipi, kısaltmalı, dolgu kelimeli ('ya şey bi 50 metre
+    yükselsene')" dedirt. Buna "bilgi damıtma" (distillation) denir: büyük
+    modelin dil bilgisi küçük modele veri yoluyla aktarılır.
+    Çıkan cümleleri gözle örnekleyerek kontrol et.
+
+(3) STT hata taklidi (çok önemli; model gerçek hayatta temiz metin görmez)
+    - Noktalama ve büyük harf yok
+    - Sayılar yazıyla: "beş yüz", "yüz elli"
+    - Tipik yanlış duyumlar: "yüksel"->"yüksek", "alçal"->"al çal",
+      "metre"->"metro", Türkçe karakter kayıpları
+    - En iyisi: kendi STT'nden geçen gerçek çıktıları toplayıp veriye katmak
+
+(4) Negatif örnekler (%10–15)
+    Alakasız cümleler ("bugün hava nasıl", "yemek ne zaman"), yarım cümleler,
+    anlamsız STT çıktıları -> "bilinmiyor". Bunlar olmazsa model her şeye
+    bir komut uydurur.
+
+(5) Çok adımlı ve bağlamlı örnekler (%10–20)
+    "önce ... sonra ...", "... ardından ...", "... ve in".
+
+(6) Kendi ses kayıtların
+    Farklı kişilere (kadın/erkek, farklı şiveler) 200–300 komut okut,
+    recordings/ altına koy. Bu, uçtan uca TEST seti olur (ses -> JSON).
+    Gürültülü ortamda (pervane sesi eklenmiş) kayıt da al.
+
+Denge: Her komut türünden benzer sayıda örnek olsun; yoksa model çok
+gördüğü komuta yatkınlaşır.
+
+Hazır veri kaynakları (yardımcı amaçlı):
+  - Mozilla Common Voice Türkçe, FLEURS Türkçe: STT testi/fine-tune'u için
+    genel Türkçe konuşma verisi.
+  - Hugging Face'te İngilizce function-calling veri setleri (xLAM, Glaive):
+    format fikri almak için; doğrudan kullanılmaz.
+  - Hugging Face'te "turkish function calling" diye ara: Türkçe araç çağırma
+    için eğitilmiş modeller/veri setleri var, örnek yapı görmek için yararlı.
+
+
+================================================================================
+8. GOOGLE MAPS ENTEGRASYONU ("EN YAKIN HASTANEYE GİT")
+================================================================================
+
+Temel fikir: LLM haritayı bilmez ve bilmesine gerek yok. LLM sadece niyeti
+çıkarır; koordinatı bulan deterministik bir araçtır.
+
+Akış:
+  "en yakın hastaneye git"
+    -> LLM            : {"komut":"yakin_yere_git","tur":"hastane"}
+    -> mission_executor: /map/find_nearest servisini çağırır
+    -> map_tools      : drone'un o anki enlem/boylamını
+                        (/fmu/out/vehicle_global_position) alır,
+                        Google Places API "Nearby Search" çağırır:
+                          POST https://places.googleapis.com/v1/places:searchNearby
+                          includedTypes: ["hospital"]
+                          locationRestriction: daire (merkez = drone, yarıçap)
+                          rankPreference: DISTANCE, maxResultCount: 1
+                          (X-Goog-FieldMask ile sadece ad + konum iste)
+    -> dönen           : ad, enlem, boylam
+    -> güvenlik        : mesafe limiti, batarya, geofence; gerekirse sesli onay
+                         ("1.2 km uzaktaki X Hastanesi'ne gidiyorum")
+    -> mission_executor: güvenli seyir irtifasına çık -> git_koordinat
+                         -> hedef üstünde bekle (ya da in)
+
+Ayrıntılar:
+  - API anahtarı Google Cloud Console'dan alınır (Places API (New) açılır).
+    Anahtarı koda gömme; ortam değişkeninde tut. Kullanım ücretlidir
+    (aylık ücretsiz kota var); geliştirme sırasında sonuçları önbelleğe al.
+  - Ücretsiz alternatif: OpenStreetMap Overpass API (amenity=hospital).
+    Anahtar gerektirmez; geliştirme ve demo için gayet yeterli.
+  - Tür eşlemesi: "hastane"->hospital, "eczane"->pharmacy,
+    "benzinlik"->gas_station, "polis"->police ... (küçük bir sözlük).
+  - İsimle arama ("Anıtkabir'e git"): Places "Text Search" / Geocoding API.
+    LLM komutu: {"komut":"yere_git","ad":"Anıtkabir"}.
+  - Simülasyonla uyum: PX4_HOME_LAT/LON gerçek bir koordinat olmalı (3.1).
+    Gazebo dünyasında bina görünmez ama koordinat matematiği doğrudur;
+    QGroundControl haritasında drone'un hastaneye gittiğini izleyebilirsin.
+  - Harita çağrısı ağ gecikmesi ekler (~200–500 ms). Çağrı sürerken drone
+    seyir irtifasına tırmanmaya başlasın; zaman boşa gitmesin.
+
+
+================================================================================
+9. HIZ VE PERFORMANS
+================================================================================
+
+--------------------------------------------------------------------------------
+9.1 Gecikme bütçesi (TAHMİNİ hedefler — kendi makinende ölçmelisin)
+--------------------------------------------------------------------------------
+  Aşama                         GPU'lu          Sadece CPU
+  ---------------------------   -------------   -------------
+  VAD konuşma bitiş bekleme     250–350 ms      250–350 ms
+  STT                           150–300 ms      400–1000 ms
+  Normalizasyon + hızlı yol     < 5 ms          < 5 ms
+  LLM (hızlı yol kaçırırsa)     50–200 ms       200–700 ms
+  Doğrulama + ROS 2 iletimi     < 10 ms         < 10 ms
+  PX4'ün tepki vermesi          20–50 ms        20–50 ms
+  ---------------------------   -------------   -------------
+  Toplam (hızlı yol)            ~0.5–0.7 sn     ~0.7–1.4 sn
+  Toplam (LLM yolu)             ~0.6–0.9 sn     ~1.0–2.1 sn
+
+Görüldüğü gibi en büyük kalemler VAD beklemesi ve STT'dir; LLM doğru
+kurulursa darboğaz değildir.
+
+--------------------------------------------------------------------------------
+9.2 Hızlandırma teknikleri (etki sırasına göre)
+--------------------------------------------------------------------------------
+Algı tarafı:
+  1. VAD bitiş sessizliğini kısalt (250–350 ms).
+  2. Akışlı/erken STT: konuşma sürerken ara sonuç al; acil kelimeyi cümle
+     bitmeden yakala.
+  3. Whisper'da dil sabit, beam_size=1, kısa ses penceresi.
+  4. Acil komutlar için ayrı, minik bir anahtar kelime tanıyıcı (KWS)
+     sürekli dinlesin — "dur" 200–300 ms'de yakalanır.
+
+Anlama tarafı:
+  5. Hızlı yol: sık komutları regex ile çöz. Komutların büyük kısmı LLM'e
+     hiç gitmez.
+  6. Küçük fine-tune'lu model + 4-bit quantization.
+  7. Kısıtlı JSON çıktı + kısa anahtarlar + max_tokens: üretilecek token
+     sayısı ~15–25'e iner. Gecikme neredeyse tamamen çıktı token sayısıdır.
+  8. Model hep bellekte; sistem prompt'u KV-cache'te (cache_prompt).
+     İlk istek yavaş olur — açılışta bir "ısınma" isteği at.
+  9. Kısa sistem prompt'u (fine-tune sayesinde mümkün).
+  10. Sonuç önbelleği: aynı normalleştirilmiş cümle tekrar gelirse LLM'i
+      çağırma (basit sözlük).
+  11. Düşünme (reasoning) modunu kapat.
+
+Yürütme tarafı:
+  12. Setpoint yayını sürekli; yeni komut sadece hedefi günceller (arm ve
+      mod geçişi beklemesi olmaz).
+  13. PX4 hız/ivme parametrelerini görev profiline göre yükselt (3.2).
+  14. İyimser başlangıç: harita sorgusu gibi yavaş işler sürerken tırmanışa
+      başla.
+  15. Node'lar aynı makinede; aynı süreçte birleştirme (composition) ya da
+      Python yerine C++ ancak ölçüm gerektirirse.
+
+Sistem tarafı:
+  16. Gazebo'yu headless çalıştır, gereksiz sensörleri (kamera) kapat —
+      CPU'yu STT/LLM'e bırak.
+  17. GPU yoksa: STT ve LLM'e ayrı CPU çekirdekleri ayır (thread sayısını
+      elle ver; ikisi aynı çekirdekler için kavga etmesin).
+
+--------------------------------------------------------------------------------
+9.3 Nasıl ölçülür
+--------------------------------------------------------------------------------
+Her mesaja şu zaman damgalarını ekle ve latency_monitor node'unda topla:
+    t0 konuşma bitti (VAD)      t1 STT çıktı verdi
+    t2 komut JSON hazır         t3 komut yürütücüye ulaştı
+    t4 ilk yeni setpoint yayınlandı
+    t5 drone hızında ilk değişim (telemetriden)
+CSV'ye yaz; ortalama, p50, p95 hesapla. Her değişiklikten sonra aynı kayıtlı
+ses dosyalarıyla (recordings/) testi tekrarla — canlı konuşmayla ölçüm
+tekrarlanabilir olmaz. Yarışma raporunda bu tablo en güçlü kanıtın olur.
+
+
+================================================================================
+10. HAZIR KULLANABİLECEĞİN PROJELER VE ARAÇLAR
+================================================================================
+
+Benzer açık kaynak projeler (kodlarını oku, fikir ve parça al):
+  - ros2-agent-ws ("Taking Flight with Dialogue" makalesi): PX4 + ROS 2 +
+    Ollama ile yerel LLM'li doğal dil drone kontrolü. Mimarisi seninkine
+    en yakın olan; prompt şablonları ve PX4 araç tanımları yararlı.
+  - EchoPilot: Sesli, Ollama + LangGraph + MAVSDK + MCP ile PX4 görev üretimi.
+    Ses hattı ve araç tasarımı için bak.
+  - AerialClaw: LLM güdümlü hava aracı ajanları için çerçeve; çalışma zamanı
+    doğrulama ve güvenlik katmanı fikirleri için.
+  - SkySim: LLM planlaması ile düşük seviye güvenliği ayıran ROS 2/Gazebo
+    çerçevesi; "LLM motoru sürmez" ilkesinin örneği.
+  Hiçbiri Türkçe değil ve hız odaklı küçük fine-tune'lu model kullanmıyor;
+  senin projenin özgün katkısı tam da burası.
+
+Yapı taşları:
+  - PX4-Autopilot           : SITL ve Gazebo modelleri
+  - px4_msgs, px4_ros_com   : mesajlar ve offboard örnek kodu (ilk bakılacak)
+  - Micro-XRCE-DDS-Agent    : köprü
+  - px4-ros2-interface-lib  : ileri seviye; ROS 2'den özel uçuş modu yazma
+  - MAVSDK-Python           : alternatif, daha basit API (ama ROS 2 dışı)
+  - QGroundControl          : izleme, parametre, harita
+  - faster-whisper, sherpa-onnx, Silero VAD : ses hattı
+  - llama.cpp (llama-server), Ollama        : LLM çalıştırma
+  - Unsloth                 : fine-tune (hazır Colab not defterleri)
+  - Piper                   : Türkçe TTS
+  - openWakeWord            : uyandırma kelimesi
+
+
+================================================================================
+11. YOL HARİTASI (FAZLAR)
+================================================================================
+
+Her fazı bitirmeden sonrakine geçme. Her fazın net bir "bitti" ölçütü var.
+
+FAZ 0 — Kurulum
+  Ubuntu 26.04, ROS 2 Lyrical, Gazebo Jetty, PX4-Autopilot, MicroXRCEAgent,
+  px4_msgs, QGroundControl.
+  Bitti: `make px4_sitl gz_x500` ile drone açılıyor, `ros2 topic echo
+  /fmu/out/vehicle_status` veri gösteriyor, QGC'den elle kalkış yapılıyor.
+
+FAZ 1 — Sessiz, LLM'siz kontrol
+  drone_interfaces + mission_executor. Komutlar terminalden JSON olarak
+  gönderilir (ros2 topic pub).
+  Bitti: kalk, yüksel, git_yon, dön, dur, in, eve_dön terminalden çalışıyor;
+  güvenlik limitleri reddediyor.
+
+FAZ 2 — Metinden komuta (fine-tune'suz)
+  command_parser: normalizasyon + hızlı yol + hazır küçük model (prompt +
+  JSON şema kısıtı). Girdi klavyeden yazılan Türkçe cümle.
+  Bitti: yazıyla "500 metre yüksel" drone'u yükseltiyor; ilk gecikme
+  ölçümleri alındı.
+
+FAZ 3 — Ses
+  voice_input: mikrofon + VAD + STT. Acil kelime yolu.
+  Bitti: sesle uçtan uca çalışıyor; kayıtlı ses dosyalarıyla tekrarlanabilir
+  test var.
+
+FAZ 4 — Veri ve fine-tune
+  Veri üretimi, baseline ölçümü, 2–3 aday modelin fine-tune'u, kıyaslama
+  tablosu, en iyisinin GGUF olarak devreye alınması.
+  Bitti: test setinde hedef doğruluk (örn. tam eşleşme > %97, yanlış kabul
+  < %1) ve gecikme hedefi sağlandı.
+
+FAZ 5 — Harita
+  map_tools (önce OSM Overpass ile, sonra Google Places), yakin_yere_git ve
+  yere_git komutları, veri setine bu komutların eklenip yeniden fine-tune.
+  Bitti: "en yakın hastaneye git" QGC haritasında doğru noktaya uçuruyor.
+
+FAZ 6 — Cilalama ve geliştirmeler
+  TTS, onay diyaloğu, gecikme optimizasyonu turu, Bölüm 12'den seçilenler,
+  demo senaryosu ve rapor.
+
+
+================================================================================
+12. GELİŞTİRME FİKİRLERİ
+================================================================================
+
+Kullanım kolaylığı:
+  - Uyandırma kelimesi ("Hey drone"): sürekli dinleme yerine tetiklemeli.
+  - Sesli geri bildirim ve onay diyaloğu (TTS).
+  - Bağlam hafızası: "biraz daha", "geri al", "aynısını tekrar yap",
+    "oraya geri dön". Son komut ve son konumlar tutulur.
+  - Göreli ifadeler: "biraz yüksel" (varsayılan 5 m), "çok hızlı git".
+  - Adlandırılmış noktalar: "burayı ev olarak kaydet", "eve git".
+
+Yetenek:
+  - Çok adımlı görev planlama ve hazır desenler: "bu alanı tara", "etrafında
+    daire çiz", "kare çiz".
+  - Kamera + nesne algılama (YOLO): "kırmızı arabayı takip et", "insan
+    görürsen dur".
+  - Görsel-dil modeli (VLM): "ne görüyorsun?" sorusuna sesli cevap.
+  - Engelden kaçınma (derinlik kamerası/LiDAR + PX4 collision prevention).
+  - Rota planlama: Google Directions/yükseklik verisiyle uçuşa yasak
+    bölgeleri ve binaları hesaba katma.
+  - Çoklu drone: "bir numara kalk, iki numara bekle"; sürü komutları.
+
+Sağlamlık ve güvenlik:
+  - Pervane gürültüsüne dayanıklılık: gürültü bastırma, gürültülü veriyle
+    STT fine-tune'u.
+  - Konuşmacı doğrulama: sadece yetkili sesin komutlarını kabul et.
+  - STT güven skoru düşükse "tekrar eder misin?".
+  - Davranış ağacı (BehaviorTree.CPP) ile daha karmaşık görev mantığı.
+  - Kara kutu kaydı: her komut, karar ve telemetri loglanır (rosbag).
+
+Sunum ve ölçüm:
+  - Web paneli: canlı harita, tanınan metin, üretilen JSON, gecikme grafiği.
+  - Model kıyaslama raporu: boyut / doğruluk / gecikme tablosu.
+
+Gerçek donanıma geçiş:
+  - Jetson Orin Nano/NX + Pixhawk (PX4). Mimari aynı kalır; SITL yerine
+    gerçek uçuş kontrolcüsü, UDP yerine seri bağlantı. Simülasyonda yazdığın
+    ROS 2 kodu neredeyse değişmeden çalışır — PX4 seçmenin asıl faydası bu.
+
+
+================================================================================
+13. RİSKLER VE DİKKAT EDİLECEKLER
+================================================================================
+
+1. Sürüm uyumu (en olası zaman kaybı)
+   ROS 2 Lyrical ve Gazebo Jetty yeni sürümler. px4_msgs'in Lyrical için
+   derlendiği doğrulandı; ancak PX4'ün simülasyon tarafının Jetty ile
+   sorunsuz çalıştığını kurulumda kendin doğrulamalısın (PX4 dokümanındaki
+   desteklenen Gazebo sürümüne bak). Sorun çıkarsa B planı: Docker içinde
+   PX4'ün resmi önerdiği ROS 2/Gazebo ikilisi; mimari hiç değişmez.
+   Her durumda Docker kullan — kurulumu tekrarlanabilir yapar.
+
+2. GPU yoksa
+   Sistem yine çalışır ama gecikme 1–2 sn bandına çıkar. CPU için küçük
+   akışlı STT + 0.3–0.6B model + headless Gazebo seç. Uzak makine
+   kullanıyorsan mikrofon sesini ağdan taşıman gerekir (ses yerelde
+   yakalanıp ROS 2 topic'i ya da soket ile gönderilir); bu da gecikme ekler.
+
+3. STT hataları LLM hatalarından daha sık olur
+   Özellikle sayılar ve kısa komutlar. Çözüm: normalizasyon, initial_prompt,
+   STT hatalı veriyle fine-tune, düşük güvende onay isteme.
+
+4. Yanlış komutun bedeli
+   Simülasyonda sorun değil ama gerçek drone hedefleniyorsa güvenlik
+   katmanı, geofence ve acil durdurma en baştan doğru kurulmalı. Yanlış
+   kabul oranını (alakasız cümleye komut üretme) ayrı metrik olarak izle.
+
+5. Offboard tuzakları
+   Setpoint akışı kesilirse failsafe; NED işaret hatası (z eksi = yukarı);
+   QoS uyumsuzluğunda sessizce veri gelmemesi; px4_msgs/PX4 sürüm farkı.
+
+6. Aşırı fine-tune
+   Sadece şablon cümlelerle eğitilen model gerçek konuşmada çöker. Veri
+   çeşitliliği ve kendi ses kayıtlarından oluşan gerçek test seti şart.
+
+7. API maliyeti ve bağımlılığı
+   Google Places ücretlidir ve internet ister. Önbellek + OSM alternatifi.
+
+8. Gerçek uçuş mevzuatı
+   Simülasyonda 500 m serbest; gerçekte irtifa sınırları ve SHGM kuralları
+   geçerli. Limitleri parametre dosyasında tut, koda gömme.
+
+
+================================================================================
+14. KAYNAKLAR
+================================================================================
+
+PX4 ve ROS 2:
+  - PX4 ROS 2 kullanıcı kılavuzu      https://docs.px4.io/main/en/ros2/user_guide
+  - PX4 offboard kontrol örneği       https://docs.px4.io/main/en/ros2/offboard_control
+  - px4_msgs                          https://github.com/PX4/px4_msgs
+  - ROS 2 Lyrical desteklenen platformlar
+    https://docs.ros.org/en/jazzy/Releases/lyrical/supported-platforms.html
+
+Benzer projeler:
+  - Taking Flight with Dialogue       https://arxiv.org/abs/2506.07509
+    (kod: https://github.com/limshoonkit/ros2-agent-ws)
+  - EchoPilot                         https://discuss.px4.io/t/echopilot-langgraph-mcp-server-for-natural-language-px4-control/46998
+  - AerialClaw                        https://arxiv.org/abs/2606.12142
+
+Fine-tune ve modeller:
+  - Unsloth FunctionGemma rehberi     https://unsloth.ai/docs/models/tutorials/functiongemma
+  - Hugging Face'te ara: "Qwen3 0.6B", "turkish function calling",
+    "whisper large v3 turbo turkish ct2"
+
+Ses:
+  - faster-whisper                    https://github.com/SYSTRAN/faster-whisper
+  - sherpa-onnx                       https://github.com/k2-fsa/sherpa-onnx
+  - Silero VAD                        https://github.com/snakers4/silero-vad
+  - Piper TTS                         https://github.com/rhasspy/piper
+
+Harita:
+  - Google Places API (Nearby Search) https://developers.google.com/maps/documentation/places/web-service/nearby-search
+  - OSM Overpass API                  https://wiki.openstreetmap.org/wiki/Overpass_API
+
+================================================================================
+  SON NOT
+  İlk hedefin Faz 1 olsun: LLM ve ses olmadan, terminalden JSON ile drone'u
+  uçurabilmek. O çalıştığında projenin en zor altyapı kısmı bitmiş olur;
+  ses ve LLM onun üstüne takılan katmanlardır.
+================================================================================
