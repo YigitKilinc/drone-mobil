@@ -1,0 +1,458 @@
+================================================================================
+  PX4 <-> ROS 2 KÖPRÜLERİ: MAVROS mu, Micro XRCE-DDS Agent mı?
+  (atobasgan/drone projesi için — MIMARI.txt / YOL_HARITASI.txt / KAVRAMLAR.txt
+   incelenerek hazırlandı)
+  Tarih: 16 Ekim 2026
+================================================================================
+
+İÇİNDEKİLER
+  0.  Kısa cevap
+  1.  Önce temel: "köprü" neden gerekiyor? (uORB, MAVLink, DDS)
+  2.  Micro XRCE-DDS Agent nedir, ne iş yapar?
+  3.  MAVROS nedir, ne iş yapar?
+  4.  İkisinin yan yana karşılaştırması
+  5.  Aynı iş iki yolla: "kalk ve 5 m'ye çık" örneği
+  6.  Senin projen için değerlendirme
+  7.  MAVROS'u hangi durumda seçerdin?
+  8.  Üçüncü yol: Zenoh (kısa not)
+  9.  Sık yapılan hatalar
+  10. Dokümanlar ve linkler
+
+
+================================================================================
+0. KISA CEVAP
+================================================================================
+
+Evet, ikisi de PX4 ile ROS dünyası arasında çalışan "köprü"lerdir. Ama farklı
+dilleri çevirirler:
+
+  MAVROS              : PX4'ün DIŞ dili olan MAVLink'i <-> ROS topic/servisleri
+  Micro XRCE-DDS Agent: PX4'ün İÇ dili olan uORB'u    <-> ROS 2 (DDS) topic'leri
+
+Senin projen için mantıklı olan: **Micro XRCE-DDS Agent (uXRCE-DDS)**.
+Repodaki mimari zaten bunu seçmiş ve bu seçim doğru. Sebepler:
+  - PX4'ün ROS 2 için resmi ve önerilen yolu bu (PX4 v1.14 ve sonrası).
+  - Arada MAVLink çeviri katmanı yok -> daha düşük gecikme. Projenin ana
+    kriteri hız olduğu için önemli.
+  - px4_ros_com içindeki offboard örneği, PX4 dokümanındaki offboard
+    rehberi ve ROS 2 Interface Library hepsi bu yolu kullanıyor.
+  - ROS 2 Lyrical çok yeni; px4_msgs'in Lyrical'da derlendiği repoda
+    doğrulanmış. MAVROS'un Lyrical için hazır paketi olup olmadığı belirsiz.
+
+MAVROS'a sadece şu durumlarda geç: ArduPilot kullanacaksan, PX4 dışında başka
+MAVLink otopilotlarını da desteklemen gerekiyorsa veya drone ile bilgisayar
+arasında sadece MAVLink telemetri hattı (ör. radyo modem) varsa.
+
+
+================================================================================
+1. ÖNCE TEMEL: "KÖPRÜ" NEDEN GEREKİYOR?
+================================================================================
+
+PX4 bir uçuş yazılımıdır (otopilot). ROS 2 ise senin bilgisayarında çalışan
+robot yazılım çerçevesidir. İkisi farklı süreçlerde, çoğu zaman farklı
+cihazlarda çalışır ve farklı "dil" konuşur. Üç kavramı bilmek yeterli:
+
+1.1 uORB — PX4'ün İÇ mesaj sistemi
+  PX4'ün içindeki modüller (EKF, konum kontrolcüsü, commander, sensör
+  sürücüleri...) birbirleriyle uORB topic'leri üzerinden konuşur.
+  Örnek uORB mesajları: vehicle_local_position, vehicle_status,
+  trajectory_setpoint, vehicle_command.
+  Bunlar PX4'ün "ham" iç verisidir; en düşük seviye, en doğrudan bilgi.
+
+1.2 MAVLink — PX4'ün DIŞ dünyayla konuştuğu protokol
+  Drone ile yer istasyonu (QGroundControl) veya başka cihazlar arasındaki
+  standart, hafif, ikili (binary) bir protokol. PX4, ArduPilot ve birçok
+  otopilot bunu konuşur.
+  PX4 içinde "mavlink" modülü uORB verisini MAVLink mesajlarına çevirip
+  dışarı gönderir (ör. LOCAL_POSITION_NED, HEARTBEAT, COMMAND_LONG).
+  Yani MAVLink, uORB'un "dışarıya uyarlanmış, standartlaştırılmış" bir
+  özetidir. Her uORB alanı MAVLink'te yoktur.
+
+1.3 DDS — ROS 2'nin altındaki haberleşme katmanı
+  ROS 2'de node'lar birbirini DDS ile bulur ve topic'ler üzerinden konuşur.
+  Bir şey DDS'e "yayın yapabiliyorsa", ROS 2 node'ları onu normal bir ROS 2
+  topic'i olarak görür.
+
+Sonuç: PX4'ün verisini ROS 2'ye taşımanın iki ana yolu var:
+  (A) uORB -> DDS        : Micro XRCE-DDS (client PX4'te, agent bilgisayarda)
+  (B) uORB -> MAVLink -> ROS : MAVROS
+
+      YOL A (uXRCE-DDS)                       YOL B (MAVROS)
+      -----------------                       --------------
+      [ROS 2 node'ların]                      [ROS 2 node'ların]
+            |  ROS 2 topic (px4_msgs)               |  ROS topic/servis
+            v                                       |  (geometry_msgs,
+      [MicroXRCEAgent]  (bilgisayarda)              |   mavros_msgs ...)
+            |  XRCE-DDS protokolü                   v
+            |  (UDP 8888 / seri port)         [mavros_node] (bilgisayarda)
+            v                                       |  MAVLink
+      [uxrce_dds_client] (PX4 içinde)               |  (UDP 14540 / seri)
+            |                                       v
+            v                                 [mavlink modülü] (PX4 içinde)
+      [uORB]                                        |
+                                                    v
+                                              [uORB]
+
+
+================================================================================
+2. MICRO XRCE-DDS AGENT NEDİR, NE İŞ YAPAR?
+================================================================================
+
+2.1 Ne?
+  "XRCE" = eXtremely Resource Constrained Environments. eProsima'nın (Fast
+  DDS'in de geliştiricisi) mikrodenetleyiciler için yaptığı hafif DDS
+  protokolüdür. Mikrodenetleyici tam bir DDS çalıştıramayacak kadar zayıf
+  olduğundan iş ikiye bölünür:
+
+    Client (istemci): Küçük cihazda çalışır. PX4'te bu, "uxrce_dds_client"
+                      modülüdür. Hafiftir, sadece mesajları paketleyip yollar.
+    Agent  (ajan)   : Güçlü bilgisayarda çalışır (MicroXRCEAgent programı).
+                      Client'ın adına GERÇEK DDS katılımcısı olur; topic'leri
+                      DDS ağında (yani ROS 2'de) yayınlar ve abone olur.
+
+  Yani Agent, "mikrodenetleyicinin DDS dünyasındaki vekili"dir.
+
+2.2 PX4'te nasıl kullanılıyor?
+  - PX4 v1.14'ten itibaren ROS 2 için resmi yol budur (öncesinde microRTPS
+    vardı, kaldırıldı).
+  - PX4 içinde hangi uORB topic'lerinin dışarı açılacağı bir YAML dosyasında
+    tanımlıdır: PX4-Autopilot/src/modules/uxrce_dds_client/dds_topics.yaml
+    Varsayılan olarak offboard kontrol için gereken topic'ler zaten açıktır.
+  - ROS 2 tarafında bu mesajların tip tanımları "px4_msgs" paketindedir.
+    px4_msgs, PX4'ün uORB .msg dosyalarının birebir kopyasıdır. Bu yüzden
+    px4_msgs dalı ile PX4 sürümü AYNI olmalı; aksi halde alanlar kayar ve
+    veri bozuk gelir ya da hiç gelmez.
+  - Topic adları: /fmu/in/...  (ROS 2 -> PX4)
+                  /fmu/out/... (PX4 -> ROS 2)
+
+2.3 Çalıştırma (repodaki YOL_HARITASI.txt Görev 0.5 ile aynı)
+  T1: make px4_sitl gz_x500         (PX4 SITL + Gazebo; client otomatik başlar)
+  T2: MicroXRCEAgent udp4 -p 8888   (agent)
+  T3: ros2 topic list | grep fmu    (topic'ler görünmeli)
+  Gerçek donanımda: agent seri port üzerinden de çalışır, ör.
+      MicroXRCEAgent serial --dev /dev/ttyUSB0 -b 921600
+  ve PX4'te UXRCE_DDS_CFG parametresiyle hangi portun kullanılacağı seçilir.
+
+2.4 Özellikler
+  + Gecikme düşük: uORB doğrudan DDS'e gider, arada protokol çevirisi yok.
+  + PX4'ün iç verisine "olduğu gibi" erişim (MAVLink'te olmayan alanlar dahil).
+  + ROS 2'nin yerel yapısına tam uyum (QoS, DDS keşfi, ROS_DOMAIN_ID).
+  + PX4 ROS 2 Interface Library ile özel uçuş modları yazabilirsin.
+  - Sadece PX4 (ve sadece ROS 2). ArduPilot'un da kendi DDS desteği var ama
+    mesaj setleri farklı; PX4 kodu oraya taşınmaz.
+  - Düşük seviyeli: arm, mod değiştirme gibi işler için VehicleCommand
+    mesajını kendin doldurman gerekir. Hazır "servis" yok.
+  - Koordinatlar PX4'ün kendi çerçevesindedir: NED (z aşağı). ROS'un
+    standardı ENU'dur; dönüşümü sen yaparsın (repo bunu zaten biliyor:
+    "500 m yukarı = z: -500").
+  - px4_msgs <-> PX4 sürüm uyumunu sen yönetirsin.
+  - QoS tuzağı: PX4 topic'leri BEST_EFFORT yayınlar; subscriber'ı varsayılan
+    RELIABLE QoS ile açarsan hiçbir şey gelmez.
+
+
+================================================================================
+3. MAVROS NEDİR, NE İŞ YAPAR?
+================================================================================
+
+3.1 Ne?
+  MAVROS = "MAVLink + ROS". Bilgisayarda çalışan bir ROS node'udur. Bir uçtan
+  otopilotla MAVLink konuşur, diğer uçtan ROS topic'leri ve servisleri sunar.
+  Yıllardır ROS 1'in standart drone köprüsüdür; ROS 2 sürümü de vardır
+  (mavlink/mavros reposunun ros2 dalı).
+
+3.2 Nasıl çalışır?
+  - MAVROS bir "eklenti (plugin)" mimarisine sahiptir: state, setpoint_position,
+    setpoint_velocity, local_position, global_position, command, param,
+    mission (waypoint), rc, imu, battery ... gibi her plugin belirli MAVLink
+    mesajlarını ROS'un standart mesajlarına çevirir.
+  - Kullandığın mesajlar çoğunlukla ROS'un standart tipleridir:
+    geometry_msgs/PoseStamped, sensor_msgs/NavSatFix, sensor_msgs/BatteryState
+    + MAVLink'e özgü olanlar için mavros_msgs.
+  - Örnek topic/servisler:
+      /mavros/state                       (bağlı mı, arm mı, mod ne)
+      /mavros/local_position/pose         (yerel konum, ENU)
+      /mavros/setpoint_position/local     (konum hedefi gönder)
+      /mavros/setpoint_raw/local          (konum/hız/ivme karışık hedef)
+      /mavros/cmd/arming                  (SERVİS: arm/disarm)
+      /mavros/set_mode                    (SERVİS: OFFBOARD, AUTO.LAND ...)
+  - Koordinat dönüşümü (ENU <-> NED, FLU <-> FRD) MAVROS tarafından otomatik
+    yapılır. Sen ROS standardında (ENU, z yukarı) düşünürsün.
+  - SITL'de bağlantı adresi tipik olarak: fcu_url:=udp://:14540@127.0.0.1:14557
+
+3.3 Özellikler
+  + Otopilottan bağımsız: Aynı ROS kodu PX4 ve ArduPilot ile (çoğunlukla)
+    çalışır, çünkü ikisi de MAVLink konuşur.
+  + Üst seviye ve rahat: arm/mod değişimi hazır servis, ENU dönüşümü otomatik,
+    mission/parametre/geofence yükleme gibi işler için hazır plugin'ler.
+  + Sadece MAVLink hattı olan durumlarda çalışır (telemetri radyosu vb.).
+  + Çok geniş kaynak/örnek havuzu (ama çoğu ROS 1 için).
+  - Ekstra çeviri katmanı: uORB -> MAVLink -> ROS. Hem PX4 tarafında hem
+    MAVROS tarafında dönüştürme olur; gecikme ve CPU yükü biraz artar.
+  - Erişebildiğin veri, MAVLink'in taşıdığıyla sınırlı. Bazı mesajlar belirli
+    hızlarla (stream rate) gelir; yüksek frekans için ayar gerekir.
+  - PX4 ekibinin ROS 2 için önerdiği ana yol değil; PX4'ün ROS 2 dokümanları
+    ve örnekleri uXRCE-DDS üzerine kurulu. MAVROS desteği MAVROS projesinin
+    kendisinden gelir.
+  - Çok yeni ROS 2 dağıtımlarında (ör. Lyrical) hazır binary paketin olup
+    olmadığını kontrol etmen gerekir; yoksa kaynaktan derlersin (mavlink,
+    GeographicLib verisi vb. bağımlılıklarla).
+
+
+================================================================================
+4. YAN YANA KARŞILAŞTIRMA
+================================================================================
+
+  Kriter               | Micro XRCE-DDS Agent        | MAVROS
+  ---------------------+-----------------------------+------------------------------
+  Neyi çevirir?        | uORB <-> DDS (ROS 2)        | MAVLink <-> ROS (1 veya 2)
+  PX4 tarafı           | uxrce_dds_client modülü     | mavlink modülü
+  Bilgisayar tarafı    | MicroXRCEAgent programı     | mavros_node (ROS node'u)
+  ROS desteği          | Sadece ROS 2                | ROS 1 ve ROS 2
+  Otopilot             | PX4 (bu mesaj setiyle)      | PX4, ArduPilot, diğer MAVLink
+  Mesaj tipleri        | px4_msgs (PX4'e özel)       | Standart ROS + mavros_msgs
+  Koordinat çerçevesi  | NED/FRD (PX4 ham)           | ENU/FLU (otomatik dönüşüm)
+  Arm / mod değiştirme | VehicleCommand mesajı yaz   | Hazır servisler
+  Gecikme              | Daha düşük (tek çeviri)     | Daha yüksek (iki çeviri)
+  Veri erişimi         | PX4 iç verisine doğrudan    | MAVLink'te olanla sınırlı
+  Sürüm hassasiyeti    | px4_msgs = PX4 sürümü şart  | MAVLink geriye uyumlu, rahat
+  PX4'ün önerisi (ROS2)| EVET, resmi yol             | Alternatif, MAVROS destekler
+  Kurulum              | Agent + px4_msgs derle      | apt ile (varsa) ya da kaynak
+  Özel uçuş modu       | ROS 2 Interface Library ile | Yok (sadece offboard)
+  QGC ile birlikte     | Evet (QGC MAVLink'ten bağlanır, ikisi paralel çalışır)
+                       | Evet (aynı MAVLink, farklı port)
+
+Önemli not: İkisi birbirini dışlamaz. PX4 hem MAVLink hem uXRCE-DDS'i aynı
+anda çalıştırabilir. Senin projende zaten QGC MAVLink'ten, ROS 2 node'ların
+uXRCE-DDS'ten bağlanıyor. Ama AYNI anda iki farklı köprüden offboard setpoint
+basmak karışıklık çıkarır; kontrol tek yoldan yapılmalı.
+
+
+================================================================================
+5. AYNI İŞ İKİ YOLLA: "KALK VE 5 M'YE ÇIK"
+================================================================================
+
+5.1 uXRCE-DDS ile (Python, rclpy) — repodaki px4_interface.py mantığı
+--------------------------------------------------------------------------------
+  from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand
+  from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
+  qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                   durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                   history=HistoryPolicy.KEEP_LAST, depth=1)
+
+  # Yayıncılar
+  self.mode_pub = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos)
+  self.sp_pub   = self.create_publisher(TrajectorySetpoint,  '/fmu/in/trajectory_setpoint', qos)
+  self.cmd_pub  = self.create_publisher(VehicleCommand,      '/fmu/in/vehicle_command', qos)
+
+  # 20 Hz zamanlayıcı: her tikte "hayattayım" + hedef
+  def tick(self):
+      m = OffboardControlMode(); m.position = True
+      m.timestamp = int(self.get_clock().now().nanoseconds / 1000)  # mikro saniye
+      self.mode_pub.publish(m)
+
+      sp = TrajectorySetpoint()
+      sp.position = [0.0, 0.0, -5.0]   # NED: z = -5 -> 5 m YUKARI
+      sp.yaw = 0.0
+      sp.timestamp = m.timestamp
+      self.sp_pub.publish(sp)
+
+      self.counter += 1
+      if self.counter == 20:           # ~1 sn setpoint aktıktan SONRA
+          self.send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)  # 6 = OFFBOARD
+          self.send_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)  # arm
+
+  def send_cmd(self, command, p1=0.0, p2=0.0):
+      c = VehicleCommand()
+      c.command = command; c.param1 = p1; c.param2 = p2
+      c.target_system = 1; c.target_component = 1
+      c.source_system = 1; c.source_component = 1
+      c.from_external = True
+      c.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+      self.cmd_pub.publish(c)
+
+  Dikkat et: arm ve mod değişimi için hazır servis yok, VehicleCommand'ı
+  elle dolduruyorsun. z eksi = yukarı.
+
+5.2 MAVROS ile (Python, rclpy)
+--------------------------------------------------------------------------------
+  from geometry_msgs.msg import PoseStamped
+  from mavros_msgs.srv import CommandBool, SetMode
+
+  self.sp_pub  = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
+  self.arm_cli = self.create_client(CommandBool, '/mavros/cmd/arming')
+  self.mode_cli = self.create_client(SetMode, '/mavros/set_mode')
+
+  def tick(self):                      # 20 Hz
+      p = PoseStamped()
+      p.header.stamp = self.get_clock().now().to_msg()
+      p.pose.position.z = 5.0          # ENU: z = +5 -> 5 m YUKARI
+      self.sp_pub.publish(p)
+
+      self.counter += 1
+      if self.counter == 20:
+          self.mode_cli.call_async(SetMode.Request(custom_mode='OFFBOARD'))
+          self.arm_cli.call_async(CommandBool.Request(value=True))
+
+  Dikkat et: daha kısa ve "ROS standart" görünüyor; ENU dönüşümünü MAVROS
+  yapıyor. Ama arka planda her setpoint önce MAVLink mesajına
+  (SET_POSITION_TARGET_LOCAL_NED), sonra PX4 içinde tekrar uORB'a çevriliyor.
+
+Her iki yolda da OFFBOARD kuralı AYNI: PX4, offboard'a geçmeden önce setpoint
+akışı ister ve akış kesilirse failsafe'e geçer. Bu PX4'ün kuralıdır, köprüye
+bağlı değildir.
+
+
+================================================================================
+6. SENİN PROJEN İÇİN DEĞERLENDİRME
+================================================================================
+
+Repodaki kararlar (MIMARI.txt Bölüm 1 ve 3.3):
+  Ubuntu 26.04 + ROS 2 Lyrical + Gazebo Jetty + PX4 SITL + uXRCE-DDS,
+  ana kriter HIZ (sesli komuttan harekete <1 sn GPU, <2 sn CPU), "DUR" gibi
+  acil komutlar ~300 ms, LLM sadece JSON üretiyor, motoru deterministik
+  kod (mission_executor / executor_node) sürüyor.
+
+Bu kararlara göre uXRCE-DDS neden doğru:
+
+  1) Hız: Gecikme bütçesinin büyük kısmı STT ve LLM'de gidiyor; köprü farkı
+     milisaniyeler mertebesinde. Yine de "DUR" yolunda her ms değerli ve
+     uXRCE-DDS daha kısa yol. MAVROS seçmek bütçeyi bozmaz ama kazandırmaz da.
+
+  2) Ekosistem: Repo Faz 0'da px4_ros_com/offboard_control ile ilerliyor,
+     Faz 1'de px4_interface.py ve executor_node.py doğrudan /fmu/in ve
+     /fmu/out üzerine kurulu. MAVROS'a geçersen bu görevlerin hepsi
+     yeniden yazılır, PX4'ün resmi örneklerinden de kopuk kalırsın.
+
+  3) Lyrical riski: Repo, px4_msgs'in Lyrical'da derlendiğini doğrulamış.
+     MAVROS'un Lyrical için binary paketinin olup olmadığı belirsiz; kaynaktan
+     derleme ek bağımlılık (mavlink, GeographicLib) ve ek zaman demek.
+     MIMARI.txt Bölüm 13'teki "en olası zaman kaybı sürüm uyumu" riskini
+     MAVROS büyütür.
+
+  4) İleri seviye: İleride "yakin_yere_git" gibi komutları gerçek bir PX4
+     uçuş moduna dönüştürmek istersen PX4 ROS 2 Interface Library sadece
+     uXRCE-DDS ile çalışır.
+
+  5) Telemetri: vehicle_status içindeki failsafe bayrakları, arm durumu,
+     nav_state gibi alanlar doğrudan geliyor. Güvenlik katmanın (safety.py)
+     bunlara ihtiyaç duyacak.
+
+uXRCE-DDS'in senin projendeki "maliyetleri" ve çözümleri:
+  - NED dönüşümü        -> px4_interface.py içinde tek bir yerde yap, LLM ve
+                           executor ENU/"yukarı pozitif" düşünsün.
+  - VehicleCommand      -> px4_interface.py'de arm(), offboard_moduna_gec(),
+                           in(), eve_don() fonksiyonlarıyla sar (repo zaten
+                           bunu planlıyor, Görev 1.3).
+  - Sürüm uyumu         -> Görev 0.7'deki gibi PX4 commit'i + px4_msgs dalını
+                           NOTLAR dosyasına yaz, Docker'a dök.
+  - QoS                 -> Tüm subscriber'lar BEST_EFFORT + TRANSIENT_LOCAL.
+
+SONUÇ: Mevcut mimariyi değiştirme. uXRCE-DDS ile devam et. MAVROS'u sadece
+"bilmen gereken alternatif" olarak gör.
+
+
+================================================================================
+7. MAVROS'U HANGİ DURUMDA SEÇERDİN?
+================================================================================
+
+  - ArduPilot'a geçmeye karar verirsen (ArduPilot dünyasında MAVROS hâlâ
+    çok yaygın; ArduPilot'un kendi DDS desteği de var ama PX4 kodun taşınmaz).
+  - Aynı yazılımın hem PX4 hem ArduPilot drone'larda çalışması gerekiyorsa.
+  - Gerçek drone'da bilgisayar uçakta değil de yerdeyse ve aradaki tek hat
+    MAVLink telemetri radyosuysa (düşük bant genişliği; MAVLink buna uygun).
+  - Hazır bir ROS 1/MAVROS projesini ROS 2'ye taşıyorsan.
+  - Mission (waypoint listesi) yükleme, parametre okuma/yazma gibi işleri
+    ROS'tan hazır servislerle yapmak istiyorsan. (uXRCE-DDS'te bunlar için
+    hazır karşılık yok; QGC veya MAVSDK kullanılır.)
+
+Not: Sadece "ROS olmadan, Python'dan drone'u basitçe süreyim" istersen
+üçüncü bir seçenek MAVSDK'dır (MAVLink tabanlı, ROS'suz kütüphane). Senin
+mimarin ROS 2 merkezli olduğu için gerek yok.
+
+
+================================================================================
+8. ÜÇÜNCÜ YOL: ZENOH (KISA NOT)
+================================================================================
+
+PX4'ün güncel dokümanında Middleware başlığı altında uXRCE-DDS'in yanında
+"Zenoh (PX4 ROS 2)" sayfası da var. Zenoh, DDS'e alternatif yeni bir
+haberleşme katmanı ve ROS 2'de rmw_zenoh olarak kullanılabiliyor. Henüz
+yeni bir seçenek; projen için şu an önerim değil ama ileride uzak makine /
+kablosuz ağ senaryosunda (DDS keşfinin zorlaştığı yerlerde) bakmaya değer.
+
+
+================================================================================
+9. SIK YAPILAN HATALAR
+================================================================================
+
+uXRCE-DDS:
+  - /fmu topic'leri yok        -> Agent çalışmıyor ya da port farklı (8888).
+  - Topic var, echo boş        -> Subscriber QoS RELIABLE kalmış; ya da
+                                  px4_msgs dalı PX4 sürümüyle uyuşmuyor.
+  - Topic adında _v1 eki        -> Yeni PX4'te bazı mesajlar sürümlü;
+                                  `ros2 topic list` ile kontrol et.
+  - Drone ters yöne gidiyor    -> NED/ENU karıştı (z işareti).
+  - Offboard'a geçmiyor        -> Önce ~1 sn setpoint akışı yok.
+  - ROS_DOMAIN_ID farklı       -> Agent ve node'lar birbirini görmez.
+
+MAVROS:
+  - /mavros/state connected=false -> fcu_url/port yanlış (SITL: 14540).
+  - Setpoint gidiyor, drone tepkisiz -> Offboard modunda değil ya da arm yok.
+  - Konum verisi yok             -> GeographicLib veri seti kurulmamış veya
+                                    MAVLink stream rate düşük.
+  - İki köprüden aynı anda setpoint -> Kontrol çakışır; tek yol seç.
+
+
+================================================================================
+10. DOKÜMANLAR VE LİNKLER
+================================================================================
+
+PX4 (genel ve ROS 2)
+  - PX4 + ROS genel bakış (ROS 1/ROS 2, MAVROS vs XRCE-DDS):
+        https://docs.px4.io/main/en/ros/
+  - PX4 ROS 2 Kullanıcı Rehberi (kurulum, px4_msgs, örnekler):
+        https://docs.px4.io/main/en/ros2/user_guide
+  - uXRCE-DDS (PX4-ROS 2/DDS köprüsü) detaylı sayfası:
+        https://docs.px4.io/main/en/middleware/uxrce_dds
+  - ROS 2 Offboard kontrol örneği:
+        https://docs.px4.io/main/en/ros2/offboard_control
+  - PX4 ROS 2 Interface Library (özel uçuş modları):
+        https://docs.px4.io/main/en/ros2/px4_ros2_interface_lib
+  - uORB mesajlaşma:
+        https://docs.px4.io/main/en/middleware/uorb
+  - Offboard modu (kurallar, failsafe):
+        https://docs.px4.io/main/en/flight_modes/offboard
+
+Micro XRCE-DDS (eProsima)
+  - Resmi doküman:
+        https://micro-xrce-dds.docs.eprosima.com/
+  - Agent kaynak kodu:
+        https://github.com/eProsima/Micro-XRCE-DDS-Agent
+
+PX4 ROS 2 paketleri
+  - px4_msgs:     https://github.com/PX4/px4_msgs
+  - px4_ros_com:  https://github.com/PX4/px4_ros_com
+
+MAVROS ve MAVLink
+  - MAVROS kaynak (ROS 2 dalı dahil):
+        https://github.com/mavlink/mavros
+  - MAVROS dokümantasyonu:
+        https://mavros.readthedocs.io/en/latest/
+  - MAVLink protokolü:
+        https://mavlink.io/en/
+  - MAVSDK (ROS'suz alternatif):
+        https://mavsdk.mavlink.io/
+
+ROS 2
+  - ROS 2 Lyrical dokümantasyonu:
+        https://docs.ros.org/en/lyrical/
+  - QoS ayarları:
+        https://docs.ros.org/en/lyrical/Concepts/Intermediate/About-Quality-of-Service-Settings.html
+
+Senin repon
+  - https://github.com/atobasgan/drone
+    (MIMARI.txt Bölüm 3.3, KAVRAMLAR.txt Bölüm 2.8 ve 5, YOL_HARITASI.txt
+     Görev 0.5 ve 1.3 bu konuyla doğrudan ilgili)
+
+================================================================================
