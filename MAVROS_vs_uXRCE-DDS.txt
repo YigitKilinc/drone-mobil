@@ -1,7 +1,5 @@
 ================================================================================
   PX4 <-> ROS 2 KÖPRÜLERİ: MAVROS mu, Micro XRCE-DDS Agent mı?
-  (atobasgan/drone projesi için — MIMARI.txt / YOL_HARITASI.txt / KAVRAMLAR.txt
-   incelenerek hazırlandı)
   Tarih: 16 Ekim 2026
 ================================================================================
 
