@@ -25,7 +25,7 @@
 1. SENARYO VE TEK CÜMLELİK CEVAP
 ================================================================================
 
-Senaryo: Yarışma/kurum bize hazır bir LLM veriyor (ya da bir bulut LLM'i
+Senaryo: Bize hazır bir LLM verilyor (ya da bir bulut LLM'i
 kullanmamız isteniyor). Modeli biz çalıştırmıyoruz, fine-tune edemiyoruz; ona
 bir HTTP API üzerinden cümle gönderip cevap alıyoruz.
 
