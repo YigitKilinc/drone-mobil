@@ -7,6 +7,7 @@ Gazebo Jetty + ROS 2 Lyrical + PX4 (SITL) + yerel küçük LLM.
 | [MIMARI.txt](MIMARI.txt) | ne ve neden: mimari, model seçimi, komut şeması |
 | [YOL_HARITASI.txt](YOL_HARITASI.txt) | hangi sırayla: fazlar ve görev listesi |
 | [KAVRAMLAR.txt](KAVRAMLAR.txt) | gereken kavramlar |
+| [LLM_API_SENARYOSU.txt](LLM_API_SENARYOSU.txt) | LLM bize hazır verilirse: API + few-shot ile Faz 2 |
 | [NOTLAR.md](NOTLAR.md) | sürümler, ölçümler, görev durumu |
 
 ## Durum
