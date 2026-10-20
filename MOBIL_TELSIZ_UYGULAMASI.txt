@@ -1,0 +1,894 @@
+================================================================================
+  MOBİL TELSİZ UYGULAMASI — TASARIM VE ENTEGRASYON DOKÜMANI
+  Türkçe Sesli Komutla Drone Kontrolü
+  (Telefon = telsiz: bas-konuş ile komut ver, drone'un cevabını dinle)
+  Tarih: 20 Ekim 2026
+================================================================================
+
+İÇİNDEKİLER
+  1.  Amaç ve özet karar
+  2.  Mevcut sisteme nereden bağlanıyor?
+  3.  Üç mimari seçenek ve karşılaştırma
+  4.  Önerilen mimari (ayrıntılı)
+  5.  Sesi telefonda nasıl alırız?
+  6.  Bas-konuş (PTT): neden VAD'den hızlı, nasıl yapılır
+  7.  Ses nasıl yazıya çevrilir? (yer istasyonunda / telefonda / bulutta)
+  8.  Veriyi drone'a en hızlı ve verimli nasıl aktarırız?
+  9.  Mesaj protokolü (telefon <-> yer istasyonu)
+  10. ROS 2 tarafı: yeni paket ve topic'ler
+  11. Geri bildirim: ekran, titreşim, sesli yanıt
+  12. Gecikme bütçesi ve ölçüm
+  13. Ağ kurulumu: sahada telefon ile bilgisayar nasıl buluşur
+  14. Güvenlik ve emniyet
+  15. Uygulama çatısı seçimi (Flutter / Kotlin / Swift / React Native)
+  16. Ekranlar ve kullanıcı akışı
+  17. Gerçek drone'a geçişte ne olur
+  18. Yol haritası (M0-M5) ve kontrol listeleri
+  19. Riskler ve açık sorular
+  20. Kaynaklar
+
+
+================================================================================
+1. AMAÇ VE ÖZET KARAR
+================================================================================
+
+Amaç: Operatör telefonu bir telsiz gibi kullanır. Ekrandaki büyük tuşa
+(ya da kulaklık/Bluetooth tuşuna) basılı tutarak konuşur: "önce 20 metre
+yüksel sonra kuzeye 50 metre git". Tuşu bırakınca komut drone'a gider;
+telefon "20 metre yükseliyorum" diye sesli ve yazılı cevap verir. Ayrı,
+her zaman görünen kırmızı bir ACİL DUR tuşu vardır.
+
+Özet karar (gerekçeleri aşağıda):
+
+  1) Telefon "akıllı mikrofon + kumanda" olur, AĞIR İŞİ YAPMAZ.
+     Ses telefonda yakalanır, bas-konuş süresince küçük parçalar halinde
+     yer istasyonuna (ROS 2'nin çalıştığı bilgisayar) akıtılır. Yazıya
+     çevirme (STT), normalizasyon, hızlı yol, LLM ve güvenlik yer
+     istasyonunda, BUGÜNKÜ kodla yapılır.
+
+  2) Bağlantı: Yerel Wi-Fi üzerinden tek bir WebSocket. Ses ikili (binary)
+     çerçeveler halinde, kontrol mesajları küçük JSON olarak gider.
+     Yer istasyonunda yeni bir ROS 2 köprü node'u (mobile_bridge) bunu
+     karşılar.
+
+  3) VAD yerine BAS-KONUŞ: "konuşma bitti mi" diye 250-400 ms sessizlik
+     beklemeye gerek kalmaz; tuşu bırakmak konuşmanın bittiğini kesin söyler.
+     Bu, mimarideki en büyük gecikme kalemini (MIMARI 9.1) sıfırlar.
+
+  4) Yedek mod: Yer istasyonuna ses gönderilemiyorsa (zayıf ağ) telefon
+     kendi üzerinde yazıya çevirip sadece METNİ gönderebilir. Bu mod
+     ikinci aşamada eklenir (Bölüm 7.2).
+
+  5) Çatı: Flutter (tek kodla Android + iOS). Sadece Android hedefleniyorsa
+     ve Bluetooth PTT tuşu kritikse doğrudan Kotlin de mantıklı (Bölüm 15).
+
+Mevcut proje mantığı DEĞİŞMEZ: "dur" yine LLM'e gitmez, LLM yine sadece
+JSON üretir, güvenlik katmanı yine her komutu kontrol eder. Telefon yalnızca
+yeni bir "ses kaynağı" ve "geri bildirim ekranı"dır.
+
+
+================================================================================
+2. MEVCUT SİSTEME NEREDEN BAĞLANIYOR?
+================================================================================
+
+Bugünkü akış (Faz 2 bitti, Faz 3 planlı):
+
+  [Mikrofon]--(Faz 3: stt_node: VAD + STT)--> /voice/text (String)
+      --> command_parser (normalize, acil, hızlı yol, LLM)
+      --> /drone/command (CommandList) --> mission_executor --> PX4
+      <-- /drone/feedback (Feedback)
+
+Telefonlu akış:
+
+  [Telefon]                                [Yer istasyonu / ROS 2]
+  mikrofon -> PTT -> ses parçaları  ==WS==> mobile_bridge
+                                            |-- /voice/utterance (ses, damgalar)
+                                            |       v
+                                            |   stt_node (Faz 3, aynı STT)
+                                            |       v
+                                            |   /voice/text --> command_parser ...
+  ACİL DUR tuşu ====================WS==>  |-- /drone/emergency_stop (Empty)
+  ekran/TTS  <======================WS===  |<- /drone/feedback, telemetri
+
+Yol haritasıyla ilişkisi: YOL_HARITASI.txt Görev 3.3'te zaten "Uzak makine
+kullanıyorsan: ses yakalama + VAD senin bilgisayarında çalışsın, sadece
+konuşma parçası uzak makineye gönderilsin" yazıyor. Telefon uygulaması bu
+maddenin daha iyi bir sürümüdür: yakalama telefonda, VAD yerine bas-konuş.
+Bu yüzden mobil uygulama Faz 3'ün YERİNE değil, Faz 3'ün ÜSTÜNE kurulur:
+stt_node'un STT motoru (faster-whisper vb.) aynen kullanılır; sadece sesin
+nereden geldiği değişir.
+
+
+================================================================================
+3. ÜÇ MİMARİ SEÇENEK VE KARŞILAŞTIRMA
+================================================================================
+
+SEÇENEK A — Telefon ses gönderir, STT yer istasyonunda   (ÖNERİLEN)
+  Telefon: mikrofon + PTT + ses akışı + geri bildirim ekranı
+  Yer    : STT (faster-whisper, GPU varsa large-v3-turbo) + geri kalan her şey
+
+SEÇENEK B — Telefon kendisi yazıya çevirir, sadece metin gönderir
+  Telefon: mikrofon + PTT + cihaz üstü STT + metin gönderimi
+  Yer    : /voice/text'ten itibaren bugünkü sistem
+
+SEÇENEK C — Telefon sesi bulut STT'ye gönderir, metni yer istasyonuna yollar
+  Telefon: mikrofon + bulut STT API'si (Google Chirp 3, Deepgram vb.)
+  Yer    : /voice/text'ten itibaren bugünkü sistem
+
+  Ölçüt                    A (yer STT)        B (telefon STT)     C (bulut STT)
+  -----------------------  -----------------  ------------------  ------------------
+  Türkçe doğruluk          EN İYİ: büyük      Belirsiz; cihaza,   İyi olabilir;
+                           model + bizim      işletim sistemine   ölçülmeli
+                           initial_prompt     bağlı (Bölüm 7.2)
+  Gecikme (Wi-Fi + GPU)    ~0.3-0.5 sn        ~0.3-1.5 sn         ~0.5-1.5 sn + ağ
+  İnternet gerekir mi      HAYIR (yerel ağ)   HAYIR               EVET
+  Bant genişliği           ~32 KB/sn (PCM)    ~0 (sadece metin)   ses kadar
+                           ~3 KB/sn (Opus)
+  Telefon pili / ısınma    Düşük             Yüksek (model)      Düşük
+  Tutarlılık / ölçüm       Kayıtlı test seti  Telefona göre       Sağlayıcıya göre
+                           ile birebir aynı   değişir             değişir
+  STT'yi iyileştirme       Bizim elimizde     Sınırlı             Elimizde değil
+  (initial_prompt, FT)
+  Maliyet                  0                  0                   Kullanım başına
+
+Neden A: Projenin "her aşama ölçülür" ilkesi (MIMARI 1) ve Faz 3/4'teki
+test kayıtları + STT seçimi + gerekirse STT fine-tune'u, STT'nin BİZİM
+kontrolümüzde olmasını gerektirir. Telefon üstü Türkçe STT'nin kalitesi
+cihaza ve işletim sistemi sürümüne göre değişir ve bazı durumlarda Türkçe
+desteği hiç doğrulanamadı (Bölüm 7.2). Ayrıca ham ses yerel Wi-Fi için çok
+küçük bir yüktür (Bölüm 8).
+
+B'yi neden yine de yapıyoruz: Ağ çok kötüyken ya da yer istasyonunda STT
+çalışmıyorken yedek olarak işe yarar; metin tek satırdır, her ağdan geçer.
+
+C: İnternet gerektirdiği ve gecikme/maliyet/gizlilik bizim kontrolümüzde
+olmadığı için ana yol olarak önerilmez. Sadece "elimizde güçlü bilgisayar
+yok ama internet var" durumunda düşünülür.
+
+
+================================================================================
+4. ÖNERİLEN MİMARİ (AYRINTILI)
+================================================================================
+
+  ┌───────────────────────── TELEFON (Flutter) ─────────────────────────┐
+  │                                                                     │
+  │  Mikrofon (16 kHz, mono, PCM16, 20 ms parçalar)                     │
+  │     │                                                               │
+  │     ├─> Halka tampon (son 300 ms, "ön kayıt")                       │
+  │     │                                                               │
+  │  [PTT tuşu basıldı] ──> ptt_basla + ön kayıt + canlı parçalar ──┐   │
+  │  [PTT tuşu bırakıldı] ─> +150 ms son kayıt ──> ptt_bitti ───────┤   │
+  │  [ACİL DUR] ──────────────────────────────> acil_dur ───────────┤   │
+  │                                                                 │   │
+  │  Ekran: tanınan metin, komut, durum, irtifa/hız/batarya   <──┐  │   │
+  │  TTS (Türkçe) + titreşim                                  <──┤  │   │
+  └──────────────────────────────────────────────────────────────┼──┼───┘
+                                                     WebSocket   │  │
+                                            (ws://IP:8765, token)│  │
+  ┌───────────────── YER İSTASYONU (ROS 2 Lyrical) ──────────────┼──┼───┐
+  │                                                              │  v   │
+  │  mobile_bridge_node                                                 │
+  │    - WebSocket sunucusu, kimlik doğrulama, tek operatör kilidi      │
+  │    - ses parçalarını konuşma kimliğine (id) göre biriktirir         │
+  │    - ptt_bitti gelince: /voice/utterance yayınla                    │
+  │    - acil_dur gelince: /drone/emergency_stop yayınla (anında)       │
+  │    - metin gelince (yedek mod): /voice/text yayınla                 │
+  │    - /drone/feedback, /voice/text, telemetriyi telefona iletir      │
+  │                                                                     │
+  │  stt_node (Faz 3)  : /voice/utterance -> STT -> /voice/text         │
+  │  command_parser    : /voice/text -> /drone/command        (BUGÜNKÜ) │
+  │  mission_executor  : /drone/command -> PX4                (BUGÜNKÜ) │
+  └─────────────────────────────────────────────────────────────────────┘
+
+Önemli tasarım noktaları:
+  - Ses TUŞ BASILIYKEN akar: Tuş bırakıldığında yer istasyonunda sesin
+    neredeyse tamamı zaten vardır; sadece son birkaç parça (~20-40 ms)
+    yoldadır. "Önce kaydet, sonra dosya gönder" yaklaşımına göre yüzlerce
+    ms kazandırır.
+  - Ön kayıt (pre-roll): İnsanlar tuşa basarken konuşmaya başlar; ilk hece
+    kesilir. Telefon hep son 300 ms'yi halka tamponda tutar ve tuşa
+    basılınca onu da gönderir.
+  - Son kayıt (post-roll): Tuş bırakıldıktan sonra 100-150 ms daha kayıt
+    alınır; son hece kesilmez. (Bu değer ayarlanabilir, ölçülerek seçilir.)
+  - ACİL DUR ses değildir: Tuşa basmak ayrı bir mesajdır ve STT/LLM'e hiç
+    uğramadan /drone/emergency_stop'a gider. Sesle "dur" demek de ayrıca
+    çalışır (acil kelime yolu), ama en hızlı yol tuştur.
+  - STT tek yerde: stt_node hem bilgisayar mikrofonunu (Faz 3) hem
+    telefondan gelen sesi aynı motorla işler. Böylece Faz 3'teki STT
+    ölçümleri ve kayıtlı test seti telefon için de geçerli olur.
+
+
+================================================================================
+5. SESİ TELEFONDA NASIL ALIRIZ?
+================================================================================
+
+5.1 Ses biçimi
+  - 16 kHz, mono, 16 bit PCM (Whisper ve VAD modellerinin beklediği biçim;
+    MIMARI 2'deki hattın girişiyle aynı).
+  - 20 ms'lik parçalar: 320 örnek = 640 bayt. (Opus da 20 ms çerçeve
+    kullanır; ileride sıkıştırmaya geçmek kolay olur.)
+  - Telefon 48 kHz kaydediyorsa 16 kHz'e TELEFONDA düşür (yeniden örnekle);
+    hem bant genişliği 3 kat azalır hem yer istasyonunda iş kalmaz.
+
+5.2 Flutter'da
+  - "record" paketi: startStream(RecordConfig(encoder: AudioEncoder.pcm16bits,
+    sampleRate: 16000, numChannels: 1)) ile ham PCM akışı verir; Android ve
+    iOS'ta desteklenir.
+  - Alternatifler: "audio_io" (16/24/48 kHz PCM16 akış, yeniden örnekleme
+    dahil), "flutter_voice_processor" (sabit boyutlu 16 bit mono çerçeveler).
+  - İzin: mikrofon izni (Android RECORD_AUDIO, iOS NSMicrophoneUsageDescription).
+
+5.3 Android'e özgü
+  - Ses kaynağı: AudioSource.VOICE_RECOGNITION tanıma için ayarlanmış
+    kaynaktır (düz frekans yanıtı gereksinimi var). Gürültü bastırma (NS) ve
+    otomatik kazanç (AGC) bu kaynakta cihaza göre açık ya da kapalı olabilir;
+    üreticiden üreticiye değişir. İki ayarı da (NS açık / kapalı) kayıtlı
+    test setinde dene, iyi olanı seç. VOICE_COMMUNICATION kaynağı yankı
+    giderme (AEC) içerir; telefon hoparlörden TTS çalarken konuşulacaksa
+    denenebilir.
+  - Arka planda dinleme: Android 14+ (API 34) mikrofonu arka planda
+    kullanmak için foreground service gerekir: manifest'te
+    android:foregroundServiceType="microphone", FOREGROUND_SERVICE_MICROPHONE
+    izni ve çalışma anında verilmiş RECORD_AUDIO. Eksik olursa uygulama
+    SecurityException ile düşer ya da arka plana geçince mikrofon susar.
+    Ekranı kapalı/başka uygulamadayken telsiz çalışacaksa bu şart.
+  - Pil optimizasyonu: Bazı üreticiler arka plan servislerini öldürür;
+    uygulamayı pil optimizasyonundan muaf tutmayı kullanıcıya önerin.
+
+5.4 iOS'a özgü
+  - AVAudioSession: kategori playAndRecord (hem kayıt hem TTS çalma),
+    Bluetooth kulaklık için allowBluetooth seçeneği. Mod olarak "measurement"
+    (işlemesiz, tanıma için temiz ses) ve "voiceChat" (yankı giderme) ayrı
+    ayrı denenmeli.
+  - Arka planda kayıt için Info.plist'te "audio" arka plan modu.
+
+5.5 Mikrofon yerleşimi ve gürültü
+  - Telefon operatörün elinde/ağzına yakın, drone'dan uzaktadır: pervane
+    gürültüsü sorunu (MIMARI 13.3, 12) yer istasyonu mikrofonuna göre çok
+    azalır. Bu, telsiz yaklaşımının sessiz bir avantajıdır.
+  - Rüzgârlı sahada kablolu ya da Bluetooth yaka/kulak mikrofonu tavsiye
+    edilir. Not: Bluetooth "kulaklık profili" (HFP) bağlantısında ses
+    çoğu zaman 16 kHz (geniş bant) ya da 8 kHz'e düşer; 8 kHz'de Türkçe STT
+    doğruluğu belirgin düşer — gerçek kulaklıkla mutlaka test et.
+
+
+================================================================================
+6. BAS-KONUŞ (PTT): NEDEN VAD'DEN HIZLI, NASIL YAPILIR
+================================================================================
+
+6.1 Neden
+  VAD ile "konuşma bitti" kararı için 250-700 ms sessizlik beklenir ve bu
+  süre her komuta eklenir (MIMARI 3.5, 9.1). Bas-konuşta tuşu bırakmak
+  konuşmanın bittiğini KESİN söyler; bekleme yok. Ayrıca:
+    - Konuşmadığın zaman hiçbir ses gönderilmez -> yanlışlıkla komut yok
+      (yanındaki biri "dur bakalım" derse drone durmaz).
+    - Telefon TTS ile cevap verirken mikrofon zaten kapalıdır -> drone kendi
+      sesini komut sanmaz (MIMARI 3.10'daki sorun kendiliğinden çözülür).
+    - Telsiz kullanan herkesin bildiği bir alışkanlık.
+
+6.2 Ekran tuşu
+  - Büyük, başparmak bölgesinde, "basılı tut" (bas-bırak değil).
+  - Basınca kısa titreşim + ton; bırakınca farklı ton. Kayıt sırasında
+    ses seviyesi göstergesi (operatör mikrofonun çalıştığını görür).
+  - Çok kısa basışları (< 250 ms) yok say: cebe sürtünme vb.
+  - En uzun konuşma süresi sınırı (ör. 15 sn): tuş takılı kalırsa kayıt
+    kendiliğinden biter.
+  - "Kilitli konuşma" isteğe bağlı: çift dokunuşla aç/kapat (eldivenli
+    kullanım için).
+
+6.3 Donanım tuşu (Bluetooth / kablolu kulaklık)
+  - Android'de kulaklık tuşları KeyEvent (KEYCODE_MEDIA_* ve
+    KEYCODE_HEADSETHOOK) olarak gelir ve MediaSession üzerinden
+    uygulamalara dağıtılır. Android 8'den itibaren olay, EN SON yerel ses
+    çalan uygulamaya gönderilir; yani uygulama kısa bir ses (ör. hazır
+    tonu) çalmış olmalı. Kablolu kulaklıkta çalışan HEADSETHOOK'un bazı
+    Bluetooth kulaklıklarda gelmediği bildirilmiştir -> hedef kulaklıkla
+    test şart.
+  - Medya tuşu genelde "bas-bırak" olayı verir, "basılı tut" vermez:
+    donanım tuşunda "bir bas = konuşmaya başla, bir daha bas = bitir"
+    modeli daha güvenilirdir.
+  - Ses seviyesi tuşları da PTT olarak kullanılabilir (ön planda ekran
+    açıkken). Pratik ve test etmesi kolay bir başlangıçtır.
+
+6.4 İsteğe bağlı: VAD destekli PTT
+  Tuş basılıyken telefonda küçük bir VAD (Silero, sherpa-onnx içinde var)
+  çalıştırıp baştaki/sondaki sessizliği kırpmak STT'yi biraz hızlandırır.
+  İlk sürümde gerekmez.
+
+
+================================================================================
+7. SES NASIL YAZIYA ÇEVRİLİR?
+================================================================================
+
+7.1 Ana yol: Yer istasyonunda (Seçenek A)
+  - Faz 3 Görev 3.2'de seçilecek STT kullanılır:
+      GPU varsa: faster-whisper + large-v3-turbo (Türkçe fine-tune'lu CT2
+                 sürümleri var), float16, beam_size=1, language="tr"
+      CPU     : faster-whisper small int8 ya da küçük akışlı Türkçe model
+    initial_prompt'a drone sözlüğü (yüksel, alçal, metre, kalkış, iniş...).
+  - stt_node'a yeni bir giriş eklenir: /voice/utterance. Mikrofon / dosya /
+    telefon — üçü de aynı STT fonksiyonuna gider.
+  - Hızlandırma: Ses tuş basılıyken geldiği için STT, tuş bırakılmadan
+    önce ısıtılabilir; akışlı bir model seçilirse kısmi sonuç bile
+    üretebilir (ilk sürüm için gerekmez).
+
+7.2 Yedek yol: Telefonda (Seçenek B)
+  Araştırma sonucu Türkçe durumu (Ekim 2026):
+
+  Seçenek                     Türkçe            Not
+  --------------------------  ----------------  ---------------------------------
+  Android SpeechRecognizer    Cihaza bağlı      createOnDeviceSpeechRecognizer
+  (cihaz üstü, API 31+)       (çalışma anında   (API 31+) internetsiz çalışır.
+                              kontrol edilmeli) Desteklenen dil listesi
+                                                RecognitionSupport ile sorulur;
+                                                "destekli ama indirilmemiş" dil
+                                                triggerModelDownload ile
+                                                indirilir. tr-TR'nin listede
+                                                olup olmadığı cihazdaki ses
+                                                servisine bağlıdır.
+  iOS SFSpeechRecognizer      Muhtemel, cihazda supportsOnDeviceRecognition ve
+  (cihaz üstü)                doğrulanmalı      requiresOnDeviceRecognition ile
+                                                internetsiz zorlanır. Türkçe
+                                                cihaz üstü tanımada eski iPad'de
+                                                sorun ve "çevrimdışı dikte
+                                                indirilmemiş" kaynaklı hatalar
+                                                (1101) bildirilmiş.
+  iOS 26 SpeechAnalyzer /     DOĞRULANAMADI     Çıkış dil listesinde Türkçe yok
+  SpeechTranscriber                             (İngilizce, Fransızca, Almanca,
+                                                İspanyolca, Çince, Japonca...).
+                                                supportedLocales ile çalışma
+                                                anında kontrol edilmeli.
+  whisper.cpp (whisper.rn,    VAR (Whisper      Çok dilli. Telefonda tiny/base
+  Flutter paketleri)          çok dilli)        hızlı, small daha doğru ama
+                                                ağır (~475 MB). Türkçe fine-tune
+                                                Whisper-small modelleri var
+                                                (WER ~%14-16, okuma sesinde);
+                                                GGML'e kendin çevirmen gerekir.
+  sherpa-onnx (Flutter,       Whisper üzerinden Android/iOS/Flutter/React Native
+  React Native)               VAR; hazır Türkçe destekli; Silero VAD ve anahtar
+                              özel model        kelime tanıma da içinde. Hazır
+                              bulunamadı        model listesinde Türkçe'ye özel
+                                                model bulunamadı.
+  Vosk                        VAR (küçük TR     Küçük modeller ~50 MB, ~300 MB
+                              model)            RAM, telefona uygun, akışlı;
+                                                doğruluk Whisper'dan düşük olur.
+  Picovoice Cheetah/Leopard   YOK               Türkçe listede yok (Cheetah:
+                                                yalnızca kurumsal planda ek dil).
+
+  Öneri (yedek mod için):
+    - Android'de önce sistemin cihaz üstü tanıyıcısını dene (sıfır model
+      boyutu, hızlı); tr-TR yoksa ya da doğruluk düşükse whisper.cpp base/small
+      (nicemlenmiş, q5/q8).
+    - iOS'ta SFSpeechRecognizer(locale: tr-TR) + requiresOnDeviceRecognition;
+      olmazsa whisper.cpp (Core ML ile hızlandırılmış).
+    - Hangisi seçilirse seçilsin: telefon METNİ gönderir; normalizasyon,
+      hızlı yol, LLM ve güvenlik yine yer istasyonundadır. (Normalizasyonu
+      telefona kopyalama — iki yerde iki farklı kural olur.)
+    - Telefon STT'sini de aynı kayıtlı test setiyle (Faz 3 Görev 3.1) ölç
+      ve sonuç tablosuna ayrı satır olarak yaz.
+
+7.3 Bulut STT (Seçenek C) — sadece bilgi
+  - Google Cloud Speech-to-Text: Chirp 3 modeli tr-TR'yi listeliyor ve akışı
+    destekliyor; Chirp 2'nin akış (streaming) dil listesinde Türkçe yok.
+  - Deepgram Türkçe akışlı STT sunuyor; "300 ms altı" iddiası üreticinin
+    kendi iddiası, bağımsız ölçüm değil.
+  - İnternet + ücret + gizlilik nedeniyle ana yol değil. Kullanılırsa
+    LLM_API_SENARYOSU.txt'deki ilkeler (zaman aşımı, yedek, anahtar
+    yönetimi) aynen geçerli.
+
+
+================================================================================
+8. VERİYİ DRONE'A EN HIZLI VE VERİMLİ NASIL AKTARIRIZ?
+================================================================================
+
+8.1 Ne kadar veri?
+  16 kHz x 16 bit x mono = 256 kbit/sn = 32 KB/sn.
+  3 saniyelik bir komut ≈ 96 KB. Ev/saha Wi-Fi'ı için önemsiz (Wi-Fi
+  onlarca Mbit/sn taşır). Yerel ağda SIKIŞTIRMA GEREKMEZ; sıkıştırma
+  kodlama gecikmesi ve kalite kaybı ekler.
+  Opus (20 ms çerçeve, geniş bant konuşma için 16-24 kbit/sn ≈ 2-3 KB/sn)
+  ancak mobil veri / VPN / zayıf bağlantıda devreye alınmalı. Opus'un
+  varsayılan algoritmik gecikmesi ~26.5 ms'dir. STT doğruluğuna etkisi
+  bizim test setimizde ölçülmeden açılmamalı.
+
+8.2 Hangi taşıma yolu?
+
+  Yol                        Artı                          Eksi
+  -------------------------  ----------------------------  -------------------------
+  Özel WebSocket köprüsü     İkili ses çerçeveleri (base64 Bir ROS 2 node'u yazmak
+  (mobile_bridge, ÖNERİLEN)  yok), tek bağlantıda ses +    gerekir (küçük, Python)
+                             kontrol + geri bildirim,
+                             kimlik doğrulama ve acil
+                             durdurmada tam kontrol, her
+                             platformda hazır kütüphane
+  rosbridge_suite            Hazır; JSON ile topic         Ses için verimsiz (JSON +
+  (WebSocket, port 9090)     yayın/abone; Flutter için     base64 ~%33 şişme); tüm
+                             roslibdart / ros2_client      ROS graph'ını açar
+                             paketleri var                 (güvenlik); Lyrical paketi
+                                                           doğrulanmalı
+  Zenoh (rmw_zenoh +         ROS 2'nin Tier-1 ara          rmw_zenoh ile Kotlin
+  zenoh-kotlin)              katmanı (Kilted'den beri);    istemcinin doğrudan uyumu
+                             Android için Kotlin kütüp-    doğrulanmadı; CDR mesaj
+                             hanesi var (minSdk 30)        kodlamasını uygulamada
+                                                           yapmak gerekir; öğrenme
+                                                           eğrisi yüksek
+  Ham UDP                    En düşük ek yük               Kayıp/sıra/kimlik
+                                                           doğrulama/yeniden bağlanma
+                                                           hepsini kendin yazarsın
+  WebRTC                     Gerçek zamanlı ses için       Sinyalleşme sunucusu,
+                             tasarlandı, Opus/jitter       karmaşık kurulum; bas-
+                             tamponu hazır                 konuş için fazla
+
+  Karar: Prototipte (M0) rosbridge ile sadece METİN göndermek en hızlı
+  başlangıçtır (bir gün). Ses akışı ve gerçek kullanım için özel WebSocket
+  köprüsü (mobile_bridge). Zenoh ileride, gerçek drone'da yer istasyonu
+  olmadan telefon -> drone doğrudan bağlantı istenirse değerlendirilir.
+
+8.3 Neden TCP (WebSocket) ve UDP değil?
+  Yerel Wi-Fi'da paket kaybı düşüktür; WebSocket ek gecikmesi birkaç ms'dir.
+  Komut ve acil durdurma mesajlarının KAYBOLMAMASI, sesin birkaç ms erken
+  gelmesinden daha önemlidir. Ses tuş basılıyken aktığı için TCP'nin
+  sıralı teslimi gecikmeyi büyütmez.
+
+8.4 Hız için ayrıntılar
+  - Bağlantı uygulama açılınca kurulur ve AÇIK kalır (her komutta yeniden
+    bağlanma yok; TLS el sıkışması ~100-200 ms).
+  - TCP_NODELAY açık (küçük çerçeveler bekletilmesin).
+  - Ses parçaları 20-40 ms'lik; daha büyük parça = daha geç son parça.
+  - Kalp atışı (ping) 1 sn'de bir: bağlantı koptuysa 2-3 sn içinde fark
+    edilir, telefon ekranında kırmızı uyarı + otomatik yeniden bağlanma.
+  - Ses ve acil durdurma aynı bağlantıda ama yer istasyonunda AYRI işlenir:
+    acil durdurma mesajı ses kuyruğunu beklemez.
+
+
+================================================================================
+9. MESAJ PROTOKOLÜ (TELEFON <-> YER İSTASYONU)
+================================================================================
+
+Tek WebSocket: ws://<yer-istasyonu-IP>:8765/telsiz
+  - Metin çerçeveleri = JSON kontrol mesajları
+  - İkili çerçeveler  = ses parçaları
+
+Telefon -> yer istasyonu
+  {"tip":"merhaba","surum":1,"token":"<kurulum anahtarı>","cihaz":"Pixel 8",
+   "ses":{"bicim":"pcm16","hz":16000,"kanal":1,"parca_ms":20}}
+  {"tip":"ptt_basla","id":42,"t_telefon":1729400000123}
+  <ikili çerçeve>: [4 bayt id (uint32, little-endian)][4 bayt sıra no][PCM]
+  {"tip":"ptt_bitti","id":42,"t_telefon":1729400002456,"parca_sayisi":118}
+  {"tip":"ptt_iptal","id":42}                       (yanlış basış)
+  {"tip":"acil_dur","t_telefon":...}
+  {"tip":"metin","id":43,"metin":"20 metre yüksel"} (yedek mod, Bölüm 7.2)
+  {"tip":"ping","t_telefon":...}
+
+Yer istasyonu -> telefon
+  {"tip":"hos_geldin","operator":true,"sunucu_saati":...}
+  {"tip":"duyuldu","id":42,"metin":"önce 20 m yüksel sonra kuzeye 50 m git",
+   "stt_ms":210}
+  {"tip":"komut","id":42,"kaynak":"llm","adimlar":[...], "kuyruga_ekle":false}
+  {"tip":"anlasilmadi","id":42,"sebep":"bilinmiyor"}
+  {"tip":"geri_bildirim","durum":"yurutuyor","mesaj":"20 metre yükseliyorum"}
+  {"tip":"telemetri","irtifa":20.3,"hiz":0.1,"batarya":0.86,"mod":"OFFBOARD",
+   "arm":true}                                      (2 Hz)
+  {"tip":"pong","t_telefon":...,"sunucu_saati":...}
+  {"tip":"hata","mesaj":"başka bir operatör bağlı"}
+
+Kurallar
+  - id her konuşmada artar; eski id'ye ait geç gelen sonuç ekranda gösterilir
+    ama "eski" diye işaretlenir.
+  - Kayıp parça varsa (sıra no atlıyorsa) yer istasyonu yine STT'ye verir ve
+    log'a yazar; ses yerel Wi-Fi'da pratikte kaybolmaz.
+  - Saat eşleme: ping/pong ile telefon-sunucu saat farkı tahmin edilir
+    (fark ≈ sunucu_saati - (t_gönder + t_al)/2). Gecikme ölçümünde
+    t_konusma_bitti = ptt_bitti'nin telefondaki zamanı, sunucu saatine
+    çevrilmiş haliyle kullanılır. Daha basit seçenek: yer istasyonunun
+    ptt_bitti'yi ALDIĞI an (ağ gecikmesi hariç tutulur, Wi-Fi'da birkaç ms).
+
+
+================================================================================
+10. ROS 2 TARAFI: YENİ PAKET VE TOPIC'LER
+================================================================================
+
+Mevcut paketlere dokunmadan eklenecekler:
+
+  ros2_ws/src/
+  ├── mobile_bridge/                 (YENİ, ament_python)
+  │   ├── mobile_bridge/
+  │   │   ├── bridge_node.py         WebSocket sunucusu + ROS yayın/abone
+  │   │   ├── protokol.py            Bölüm 9 mesajları (ROS'suz, test edilir)
+  │   │   └── saat_esleme.py         ping/pong ile saat farkı
+  │   └── test/                      sahte istemci ile protokol testleri
+  └── drone_interfaces/msg/
+      └── AudioUtterance.msg         (YENİ)
+            builtin_interfaces/Time t_konusma_basladi
+            builtin_interfaces/Time t_konusma_bitti
+            uint32 id
+            string kaynak            # telefon | mikrofon | dosya
+            uint32 ornekleme_hz      # 16000
+            int16[] ornekler         # mono PCM
+
+  Topic'ler:
+    /voice/utterance  (AudioUtterance)   mobile_bridge -> stt_node   YENİ
+    /voice/text       (String)           stt_node / mobile_bridge -> parser
+    /drone/emergency_stop (Empty)        mobile_bridge -> executor
+    /drone/feedback   (Feedback)         executor/parser -> mobile_bridge
+    /drone/command    (CommandList)      parser -> executor (köprü dinler,
+                                         telefona "komut" mesajı olarak iletir)
+    /fmu/out/...                         köprü telemetri için okur (PX4_QOS)
+
+  Kütüphane: Python "websockets" (asyncio) ya da "aiohttp". rclpy döngüsü ile
+  asyncio döngüsü ayrı thread'lerde çalışır; aralarında thread-güvenli
+  kuyruk. Ses mesajı tek parça yayınlanır (3 sn ≈ 96 KB; ROS 2 için küçük).
+
+  stt_node'a eklenecek tek şey: /voice/utterance aboneliği -> mevcut STT
+  fonksiyonu -> /voice/text. (Mikrofon ve dosya modları aynen kalır.)
+
+  Launch: drone_bringup'a telsiz.launch.py (mobile_bridge + stt_node +
+  parser + executor) ve config/telsiz.yaml:
+      port: 8765
+      token_env: TELSIZ_TOKEN        # anahtar ortam değişkeninde
+      tek_operator: true
+      on_kayit_ms: 300               # bilgi amaçlı; ön kayıt telefonda
+      en_uzun_konusma_s: 15
+      telemetri_hz: 2.0
+      baglanti_koparsa: dur          # dur | devam  (Bölüm 14)
+
+
+================================================================================
+11. GERİ BİLDİRİM: EKRAN, TİTREŞİM, SESLİ YANIT
+================================================================================
+
+  - Ekranda her konuşma için bir kart: tanınan metin -> üretilen komut(lar)
+    -> durum (kabul / yürütüyor / tamamlandı / reddedildi + sebep).
+    Operatör "yanlış duydu mu, yanlış mı anladı" ayrımını görür; bu, hata
+    ayıklamanın en hızlı yoludur.
+  - Titreşim: kabul (kısa), reddedildi (iki kısa), acil dur (uzun).
+  - TTS: Telefonun kendi Türkçe sesi (iOS AVSpeechSynthesisVoice "tr-TR";
+    Android TextToSpeech Türkçe ses paketi, cihazda yüklü olmalı). Cihazda
+    ses paketi yoksa kullanıcıya indirmesi söylenir; yoksa yalnızca ekran +
+    ton. Telefonda TTS yapmak, yer istasyonunda Piper (MIMARI 3.10)
+    çalıştırıp ses göndermekten hem hızlı hem basit.
+  - Sık cümleler ("anlaşıldı", "duruyorum", "reddedildi") için hazır kısa
+    ses dosyaları -> anında çalar.
+  - Bas-konuş sayesinde TTS sırasında mikrofon kapalıdır. Operatör TTS
+    sürerken tuşa basarsa TTS susturulur (araya girme).
+  - Telemetri şeridi: irtifa, hız, batarya, mod, arm, bağlantı kalitesi
+    (ping ms). İsteğe bağlı: küçük harita (drone konumu, QGC'nin yerini
+    tutmaz).
+
+
+================================================================================
+12. GECİKME BÜTÇESİ VE ÖLÇÜM
+================================================================================
+
+TAHMİNİ (ölçülmeli) — tuş bırakıldı -> drone yeni hedefe yöneldi:
+
+  Aşama                                   Telsiz + GPU    Telsiz + CPU
+  --------------------------------------  --------------  --------------
+  Son kayıt (post-roll)                   100-150 ms      100-150 ms
+  Son parçaların Wi-Fi ile gelmesi        5-30 ms         5-30 ms
+  VAD bitiş bekleme                       0 (PTT)         0 (PTT)
+  STT                                     150-300 ms      400-1000 ms
+  Normalizasyon + hızlı yol               < 5 ms          < 5 ms
+  LLM (hızlı yol kaçırırsa)               50-200 ms       ~1000-2000 ms*
+  Güvenlik + ROS + PX4 tepkisi            30-60 ms        30-60 ms
+  --------------------------------------  --------------  --------------
+  Toplam (hızlı yol)                      ~0.3-0.5 sn     ~0.55-1.2 sn
+  * Faz 2'de 4 çekirdekli CPU'da ölçülen değer (NOTLAR.md).
+
+  ACİL DUR tuşu: telefon -> Wi-Fi -> köprü -> executor: ~10-40 ms.
+
+  Karşılaştırma: Bilgisayar mikrofonu + VAD yolunda VAD beklemesi tek
+  başına 250-350 ms (MIMARI 9.1). Telsiz yolu bunu post-roll'a (100-150 ms)
+  indirir ve acil durdurmayı ~sıfıra yaklaştırır.
+
+Ölçüm (MIMARI 9.3 ile aynı damgalar):
+  t0 = ptt_bitti (telefon saati, sunucuya çevrilmiş)
+  t1 = STT bitti, t2 = komut JSON hazır, t3 = executor aldı,
+  t4 = ilk yeni setpoint, t5 = telemetride hız değişimi
+  + telefona özel: t_ag = ptt_bitti'nin köprüye ulaşması - t0
+  latency_monitor (Faz 3 Görev 3.5) bu alanları da CSV'ye yazar.
+
+Tekrarlanabilir test: Uygulamaya "test kaydı modu" ekle: kayıtlı WAV
+dosyalarını (recordings/) mikrofon yerine akıt. Böylece aynı 100 kayıt
+telefon -> Wi-Fi -> STT hattından da geçer, sonuçlar karşılaştırılabilir.
+Uygulama ayrıca Faz 3 Görev 3.1'deki kayıtları toplamak için de kullanılır
+(her PTT konuşmasını etiketleyip WAV olarak saklama).
+
+
+================================================================================
+13. AĞ KURULUMU: SAHADA TELEFON İLE BİLGİSAYAR NASIL BULUŞUR
+================================================================================
+
+  Senaryo                       Kurulum                         Not
+  ----------------------------  ------------------------------  ------------------
+  Ev / laboratuvar              Aynı Wi-Fi modem                En kolay
+  Saha (internet yok)           Dizüstü bilgisayar hotspot açar  Önerilen saha
+                                ya da taşınabilir router         kurulumu
+  Saha (sadece telefon interneti) Telefon hotspot, bilgisayar  Telefon hem ağ hem
+                                ona bağlanır                    istemci; çalışır
+  Uzaktan (farklı şehir)        VPN (Tailscale / WireGuard)     Mobil veri gecikmesi
+                                                                eklenir; portu
+                                                                internete AÇMA
+
+  Bağlantı kolaylığı:
+    - Yer istasyonu açılışta terminalde ve (isteğe bağlı) ekranda bir QR kod
+      gösterir: ws://192.168.x.y:8765/telsiz?token=... Telefon QR'ı okutur,
+      bitti. IP adresi değişse bile yeniden okutmak yeterli.
+    - Alternatif: mDNS/Bonjour ile "_telsiz._tcp" hizmet duyurusu; telefon
+      ağdaki yer istasyonunu kendisi bulur.
+    - Docker'daki ROS (docker/docker-compose.yml) zaten network_mode: host
+      kullanıyor; 8765 portu doğrudan erişilebilir olur.
+
+
+================================================================================
+14. GÜVENLİK VE EMNİYET
+================================================================================
+
+  Kimlik ve yetki
+  - Kurulum anahtarı (token): yer istasyonunda ortam değişkeninde
+    (TELSIZ_TOKEN), QR ile telefona geçer. Anahtarsız bağlantı reddedilir.
+    Anahtar git'e girmez (.gitignore zaten .env'i dışarıda tutuyor).
+  - Tek operatör: Aynı anda tek telefon komut verebilir; ikinci telefon
+    "izleyici" olarak bağlanır (sadece geri bildirim + telemetri görür).
+  - Sadece yerel ağ / VPN. Port asla internete açılmaz. Gerekirse wss://
+    (TLS) — yerel ağda bile, ortak Wi-Fi'da çalışılacaksa önerilir.
+
+  Emniyet (güvenlik katmanı zaten var, bunlar telefon kaynaklı ek kurallar)
+  - ACİL DUR her ekranda, her zaman, tek dokunuş. Onay sormaz.
+  - Bağlantı koparsa: köprü 3 sn kalp atışı alamazsa "telsiz koptu" der ve
+    ayara göre (baglanti_koparsa: dur) /drone/emergency_stop yayınlar ->
+    drone yerinde asılı kalır. Gerçek uçuşta bu davranış (dur / eve dön)
+    ayrıca düşünülmeli; PX4'ün kendi failsafe'leri ayrıca geçerli.
+  - Tuş takılı kalırsa en uzun konuşma süresi (15 sn) sonunda kayıt biter.
+  - Telefon kilitlenirse/uygulama kapanırsa = bağlantı koptu kuralı işler.
+  - Mevcut güvenlik katmanı (irtifa, mesafe, geofence, batarya) AYNEN
+    geçerli; telefon hiçbir şeyi atlatamaz, yalnızca metin/ses sağlar.
+  - Riskli komutlarda onay (MIMARI 3.8): telefon ekranında "Onayla / İptal"
+    düğmeleri sesli onaydan daha hızlı ve hatasızdır.
+
+
+================================================================================
+15. UYGULAMA ÇATISI SEÇİMİ
+================================================================================
+
+  Çatı            Ses akışı             Arka plan / PTT tuşu   Telefon STT (yedek)   Değerlendirme
+  --------------  --------------------  ---------------------  --------------------  ----------------
+  Flutter         record / audio_io     Platform kanalı ile    sherpa_onnx,          ÖNERİLEN: tek kod,
+  (Dart)          (PCM16 akış)          yerel kod gerekebilir  whisper paketleri,    iki platform, hızlı
+                                                               speech_to_text        arayüz
+  Kotlin (yerel   AudioRecord (tam      En iyi (foreground     SpeechRecognizer,     Sadece Android ve
+  Android)        kontrol)              service, MediaSession) whisper.cpp, Vosk,    donanım PTT kritikse
+                                                               zenoh-kotlin          en sağlam
+  Swift (yerel    AVAudioEngine         En iyi iOS uyumu       SFSpeechRecognizer,   Sadece iOS ise
+  iOS)                                                         whisper.cpp (Core ML)
+  React Native    Topluluk paketleri    Yerel modül gerekebilir whisper.rn,          JS bilen ekip için
+                                                               react-native-
+                                                               sherpa-onnx
+
+  Flutter paketleri (başlangıç listesi):
+    record (mikrofon PCM akışı), web_socket_channel (WebSocket),
+    flutter_tts (Türkçe TTS), mobile_scanner (QR), permission_handler
+    (izinler), vibration/haptic (titreşim), wakelock_plus (ekran açık kalsın),
+    flutter_foreground_task (Android arka plan servisi),
+    sherpa_onnx ya da bir whisper.cpp paketi (yedek mod, M4'te).
+  Not: Paket sürümleri hızlı değişir; kurulum günü pub.dev'de güncel sürüm
+  ve bakım durumu kontrol edilmeli.
+
+  Uygulama klasörü önerisi (repo içinde, ROS'tan ayrı):
+    mobile/telsiz_app/        Flutter projesi
+      lib/ses/                mikrofon, halka tampon, PTT
+      lib/baglanti/           WebSocket istemcisi, protokol, saat eşleme
+      lib/ekran/              PTT ekranı, geçmiş, ayarlar
+      lib/geri_bildirim/      TTS, titreşim, tonlar
+      test/                   protokol testleri (sahte sunucu)
+
+
+================================================================================
+16. EKRANLAR VE KULLANICI AKIŞI
+================================================================================
+
+  1) Bağlan: "QR okut" düğmesi / elle IP. Bağlantı durumu + ping ms.
+  2) Telsiz (ana ekran):
+       üstte  : telemetri şeridi (irtifa, hız, batarya, mod, arm, bağlantı)
+       ortada : son konuşmaların kartları (duyulan -> komut -> durum)
+       altta  : BÜYÜK bas-konuş tuşu (basılıyken dalga göstergesi)
+       sağ üst: kırmızı ACİL DUR (her zaman görünür)
+  3) Onay penceresi: riskli komutta "Onayla / İptal" (büyük düğmeler).
+  4) Ayarlar: post-roll ms, TTS aç/kapat, titreşim, donanım tuşu seçimi,
+     ses kaynağı (Android: tanıma / iletişim), yedek mod (telefonda STT),
+     test kaydı modu, kayıt toplama modu.
+
+  Akış: Uygulamayı aç -> QR -> bağlandı (yeşil) -> tuşa bas, konuş, bırak
+  -> kart "duyuldu: ..." -> "komut: ..." -> "yürütüyor" -> TTS cevabı.
+
+
+================================================================================
+17. GERÇEK DRONE'A GEÇİŞTE NE OLUR
+================================================================================
+
+  - Simülasyonda yer istasyonu = Gazebo + PX4 SITL'in çalıştığı bilgisayar.
+  - Gerçek drone'da (MIMARI 12, "Jetson + Pixhawk"):
+      (a) Yer istasyonu yerde kalır (dizüstü), drone ile telemetri
+          radyosu / Wi-Fi bağlantısı vardır. Telefon dizüstüne bağlanır.
+          Mimari birebir aynı.
+      (b) ROS 2 drone üzerindeki bilgisayarda (Jetson) çalışır; telefon
+          doğrudan drone'un Wi-Fi'ına bağlanır. Menzil Wi-Fi ile sınırlıdır
+          (genelde yüzlerce metre); STT için Jetson'ın GPU'su kullanılır.
+  - Her iki durumda telefon uygulaması ve protokol DEĞİŞMEZ; sadece
+    bağlanılan IP değişir.
+  - Mevzuat (MIMARI 13.8): gerçek uçuşta telefonla sesli kumanda yardımcı
+    bir arayüzdür; RC kumandanın ve pilotun yerini tutmaz.
+
+
+================================================================================
+18. YOL HARİTASI (M0-M5) VE KONTROL LİSTELERİ
+================================================================================
+
+Mevcut faz sırası korunur: Faz 3 (ses) ile birlikte ya da hemen sonrasında
+yapılır. M1 ve sonrası Faz 3'teki stt_node'a ihtiyaç duyar.
+
+--------------------------------------------------------------------------------
+M0 — Prototip: telefondan METİN (1 gün)
+--------------------------------------------------------------------------------
+  [ ] Yer istasyonunda rosbridge_server (port 9090). (Lyrical paketini
+      doğrula; yoksa kaynaktan derle ya da M1'deki köprüye geç.)
+  [ ] Flutter'da tek ekran: metin kutusu + "gönder" -> /voice/text,
+      /drone/feedback'i listele, ACİL DUR -> /drone/emergency_stop.
+KONTROL:
+  [ ] Telefondan "kalk" yazınca simülasyonda drone kalkıyor.
+  [ ] Telefondaki ACİL DUR drone'u durduruyor.
+
+--------------------------------------------------------------------------------
+M1 — Bas-konuş ses akışı + mobile_bridge
+--------------------------------------------------------------------------------
+  [ ] AudioUtterance.msg; mobile_bridge paketi (Bölüm 9-10).
+  [ ] stt_node'a /voice/utterance girişi.
+  [ ] Uygulama: 16 kHz PCM akışı, ön kayıt (300 ms), son kayıt (150 ms),
+      PTT tuşu, ptt_basla/ptt_bitti/acil_dur mesajları, token.
+  [ ] Protokol testleri: sahte istemci ile (ROS'suz).
+KONTROL:
+  [ ] Telefona "on metre yüksel" deyince /voice/text'te "10 m yüksel".
+  [ ] İlk hece kesilmiyor (ön kayıt çalışıyor).
+  [ ] Yanlış token ile bağlantı reddediliyor.
+
+--------------------------------------------------------------------------------
+M2 — Geri bildirim ve telemetri
+--------------------------------------------------------------------------------
+  [ ] duyuldu / komut / geri_bildirim / telemetri mesajları ve kartlar.
+  [ ] Türkçe TTS + titreşim + tonlar.
+KONTROL:
+  [ ] Sesli senaryo: kalk -> 20 m yüksel -> sağa dön -> ileri git -> dur
+      -> eve dön; her adımda doğru kart ve TTS cevabı.
+
+--------------------------------------------------------------------------------
+M3 — Dayanıklılık ve emniyet
+--------------------------------------------------------------------------------
+  [ ] Kalp atışı, otomatik yeniden bağlanma, "telsiz koptu" -> dur.
+  [ ] Tek operatör kilidi, en uzun konuşma süresi.
+  [ ] Android foreground service (mikrofon tipi), iOS arka plan ses modu.
+  [ ] Donanım tuşu (ses seviyesi tuşu; sonra Bluetooth kulaklık).
+KONTROL:
+  [ ] Wi-Fi'ı kapatınca 3 sn içinde drone yerinde asılı kalıyor ve
+      telefonda uyarı çıkıyor; Wi-Fi gelince kendiliğinden bağlanıyor.
+  [ ] Ekran kapalıyken donanım tuşuyla komut verilebiliyor (hedef cihazda).
+
+--------------------------------------------------------------------------------
+M4 — Yedek mod: telefonda STT
+--------------------------------------------------------------------------------
+  [ ] Android: cihaz üstü SpeechRecognizer (tr-TR desteğini çalışma anında
+      kontrol), yoksa whisper.cpp base/small (nicemlenmiş).
+  [ ] iOS: SFSpeechRecognizer(tr-TR) + requiresOnDeviceRecognition.
+  [ ] "metin" mesajıyla gönderim; ses gönderilemiyorsa otomatik geçiş.
+KONTROL:
+  [ ] Yer istasyonu STT'si kapalıyken telefondan komut verilebiliyor.
+  [ ] Telefon STT'sinin doğruluğu/süresi kayıtlı test setinde ölçüldü.
+
+--------------------------------------------------------------------------------
+M5 — Ölçüm ve cilalama
+--------------------------------------------------------------------------------
+  [ ] latency_monitor'e telefon damgaları; 100 kayıtla telsiz hattı ölçümü.
+  [ ] Post-roll (150 -> 100 ms), ses kaynağı (NS açık/kapalı), Opus (sadece
+      zayıf ağ için) denemeleri; her biri tek değişiklik, aynı test seti.
+  [ ] Kayıt toplama modu ile Faz 3/4 için gerçek ses verisi.
+KONTROL:
+  [ ] Tablo: bilgisayar mikrofonu + VAD vs telsiz + PTT (aşama aşama ms).
+  [ ] Hedef: GPU'lu yer istasyonunda tuş bırakma -> hareket < 0.5 sn
+      (hızlı yol), ACİL DUR < 100 ms.
+
+
+================================================================================
+19. RİSKLER VE AÇIK SORULAR
+================================================================================
+
+  1. Telefon üstü Türkçe STT desteği belirsiz (iOS SpeechTranscriber'da
+     doğrulanamadı; Android'de cihaza bağlı). Ana yol yer istasyonu STT'si
+     olduğu için proje bundan etkilenmez; yedek mod için cihazda test şart.
+  2. Bluetooth kulaklık: tuş olaylarının uygulamaya gelmesi ve 8/16 kHz
+     ses kalitesi cihaza göre değişir. Hedef kulaklık erkenden test edilmeli.
+  3. Android üretici pil optimizasyonları arka plan servisini öldürebilir.
+  4. rosbridge'in ROS 2 Lyrical paketi bu araştırmada doğrulanamadı
+     (M0 için); doğrulanamazsa M0'ı da doğrudan mobile_bridge ile yap.
+  5. Zenoh ile doğrudan telefon -> ROS 2 bağlantısı mümkün görünüyor
+     (Android Kotlin kütüphanesi var) ama rmw_zenoh ile uyumu doğrulanmadı;
+     bu yüzden ilk sürümde kullanılmıyor.
+  6. Wi-Fi menzili sahada sınırlı; operatör yer istasyonuna yakın durmalı
+     ya da taşınabilir router kullanılmalı.
+  7. Tüm gecikme rakamları TAHMİNDİR; M5'te ölçülerek doğrulanacak.
+
+
+================================================================================
+20. KAYNAKLAR
+================================================================================
+
+Telefonda ses yakalama
+  - Flutter cookbook: Record or stream audio input
+    https://docs.flutter.dev/cookbook/audio/record
+  - audio_io (PCM16 akış)      https://pub.dev/documentation/audio_io/0.6.1/
+  - flutter_voice_processor     https://pub.dev/documentation/flutter_voice_processor/latest/
+  - Android ses ön işleme (VOICE_RECOGNITION, NS/AGC/AEC)
+    https://source.android.com/docs/core/audio/implement-pre-processing
+  - Android foreground service türleri (microphone)
+    https://developer.android.com/develop/background-work/services/fgs/service-types
+  - Android medya tuşları      https://developer.android.com/media/legacy/media-buttons
+  - Medya tuşu yönlendirme (Android 8 davranışı)
+    https://issuetracker.google.com/issues/65175978
+
+Telefonda STT
+  - Android RecognitionSupport (cihaz üstü dil desteği)
+    https://developer.android.com/reference/android/speech/RecognitionSupport.Builder
+  - Android cihaz üstü tanıma denemesi
+    https://hackernoon.com/testing-androids-on-device-speech-recognition-with-hindi-english-code-switching
+  - Apple SFSpeechRecognizer   https://developer.apple.com/documentation/speech/sfspeechrecognizer
+  - Apple forum: iPad'de cihaz üstü Türkçe tanıma
+    https://developer.apple.com/forums/thread/671662
+  - Apple forum: cihaz üstü zorlama  https://developer.apple.com/forums/thread/693409
+  - SpeechAnalyzer / SpeechTranscriber
+    https://developer.apple.com/documentation/speech/speechtranscriber
+    https://blog.addpipe.com/apple-speechanalyzer-api/
+    https://antongubarenko.substack.com/p/ios-26-speechanalyzer-guide
+  - whisper.rn (React Native)  https://www.mintlify.com/mybigday/whisper.rn
+  - whisper_flutter_coreml     https://pub.dev/documentation/whisper_flutter_coreml/latest/
+  - sherpa-onnx Flutter        https://pub.dev/documentation/sherpa_onnx/
+  - sherpa-onnx Flutter örnek  https://github.com/Jason-chen-coder/Flutter-EasySpeechRecognition
+  - react-native-sherpa-onnx   https://github.com/XDcobra/react-native-sherpa-onnx
+  - Vosk modelleri             https://alphacephei.com/vosk/models
+  - Türkçe Whisper-small ince ayar (makale)  https://arxiv.org/abs/2307.04765
+  - Türkçe Whisper-small modeli (WER %14.4)
+    https://friendli.ai/models/GoktugD/DUSUNEN-Dinle-244M-v1
+  - Picovoice Cheetah dilleri  https://picovoice.ai/docs/cheetah
+  - Picovoice Leopard dilleri  https://picovoice.ai/docs/leopard
+
+Bulut STT (bilgi)
+  - Google Chirp 3 (tr-TR)     https://docs.cloud.google.com/speech-to-text/docs/models/chirp-3
+  - Google Chirp 2             https://docs.cloud.google.com/speech-to-text/docs/models/chirp-2
+  - Deepgram Türkçe            https://deepgram.com/product/speech-to-text/turkish
+
+TTS
+  - AVSpeechSynthesisVoice     https://developer.apple.com/documentation/avfaudio/avspeechsynthesisvoice
+
+Taşıma ve ROS 2
+  - rosbridge_suite            https://github.com/robotwebtools/rosbridge_suite
+  - rosbridge_server           https://index.ros.org/p/rosbridge_server/
+  - roslibdart                 https://pub.dev/packages/roslibdart
+  - roslibdart_new (ROS 2)     https://pub.dev/packages/roslibdart_new
+  - ros2_client (Dart, tipli)  https://pub.dev/documentation/ros2_client/latest/
+  - ROS 2 Lyrical: Zenoh ile çalışma
+    https://docs.ros.org/en/lyrical/Installation/RMW-Implementations/Non-DDS-Implementations/Working-with-Zenoh.html
+  - ROS 2 Kilted (Zenoh Tier 1) https://www.openrobotics.org/blog/2025/5/23/ros-2-kilted-kaiju-released
+  - zenoh-kotlin               https://awesome.ecosyste.ms/projects/github.com%2Feclipse-zenoh%2Fzenoh-kotlin
+  - Zenoh Android demosu       https://zenoh.io/blog/2024-04-30-zenoh-electrode/
+
+Ses kodlama
+  - Opus RTP yük biçimi (bit hızı önerileri)
+    https://datatracker.ietf.org/doc/html/draft-ietf-payload-rtp-opus-11
+  - Opus çerçeve boyutu ve gecikme
+    https://lists.xiph.org/pipermail/opus/2014-November/002731.html
+  - Opus (genel)               https://en.wikipedia.org/wiki/Opus_(audio_format)
+
+================================================================================
+  SON NOT
+  Telefon bu sistemde "kulak ve ağız"dır, "beyin" değildir. Beyin (STT,
+  anlama, güvenlik, uçuş) yer istasyonunda kalır ve bugünkü kodla aynıdır.
+  Bu ayrım hem hızı (bas-konuş + yerel Wi-Fi) hem güvenliği (tek kontrol
+  noktası) hem de ölçülebilirliği (tek STT, tek test seti) korur.
+================================================================================
